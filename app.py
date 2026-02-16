@@ -1,243 +1,283 @@
-import base64
-import heapq
-import html
+import os
 import re
 import time
-import uuid
-import zlib
-from typing import Optional, List, Tuple, Dict, Set
-from urllib.parse import quote
+from collections import deque
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-import plotly.graph_objects as go
 import requests
 import streamlit as st
-from sklearn.neighbors import NearestNeighbors
+import plotly.graph_objects as go
 
-# =========================
-# URLs
-# =========================
-DATA_URL = "https://raw.githubusercontent.com/AyrtonB/EveryNoise-Watch/main/data/genre_attrs.csv"
+# ----------------------------
+# Page setup + CSS tweaks
+# ----------------------------
+st.set_page_config(page_title="Phase 1 Prototype — Genre Map", layout="wide")
+
+st.markdown(
+    """
+<style>
+/* Make dropdown feel clickable (cursor pointer) */
+div[data-baseweb="select"] * { cursor: pointer !important; }
+
+/* Reduce chart padding */
+div[data-testid="stPlotlyChart"] > div { padding: 0 !important; }
+
+/* Nicer sidebar spacing */
+section[data-testid="stSidebar"] .block-container { padding-top: 1.0rem; }
+
+/* Prevent long genre lists from blowing out layout */
+.small-muted { font-size: 0.85rem; color: rgba(255,255,255,0.65); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+UA = "genre-map-proto/1.0 (personal project)"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
-WIKI_UA = "genre-map-proto/1.0 (personal project)"
-
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
+SPOTIFY_API = "https://api.spotify.com/v1"
 
-HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
-NONE_OPTION = "— none —"
-
-# Used for “faint” dot colors (we blend colors instead of using opacity so dots stay crisp)
-BG_HEX = "#0b0f17"
-
-# Wikipedia scoring helpers
-MUSIC_TERMS = {
-    "music", "musical", "genre", "style", "band", "song", "album",
-    "rock", "jazz", "blues", "hip hop", "hip-hop", "electronic", "dance",
-    "folk", "punk", "metal", "pop", "rap", "reggae", "soul", "funk", "country",
-    "classical", "orchestra", "composer", "singer", "guitar", "drum", "rhythm",
-}
-PLACE_TERMS = {
-    "city", "town", "county", "province", "state", "capital", "municipality",
-    "river", "lake", "mountain", "is the largest", "is a city", "is a town",
-}
-
-
-# =========================
-# Small helpers
-# =========================
-def safe_hex(s: str) -> str:
-    if s is None:
-        return "#888888"
-    s = str(s).strip()
-    if not s:
-        return "#888888"
-    if not s.startswith("#"):
-        s = "#" + s
-    if HEX_RE.match(s):
-        return s
-    return "#888888"
-
-
+# ----------------------------
+# Helpers
+# ----------------------------
 def norm_title(s: str) -> str:
-    s = (s or "").lower()
-    s = re.sub(r"\(.*?\)", "", s)
-    s = re.sub(r"[^a-z0-9\s]+", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = (s or "").strip().lower()
+    s = re.sub(r"\s+", " ", s)
     return s
 
 
-def strip_tags(s: str) -> str:
-    s = re.sub(r"<.*?>", "", s or "")
-    return html.unescape(s).strip()
+def clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
 
 
-def hex_to_rgb(h: str) -> Tuple[int, int, int]:
-    h = safe_hex(h).lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+def safe_get_secret(name: str) -> Optional[str]:
+    # Streamlit Cloud secrets or environment vars
+    try:
+        if name in st.secrets:
+            return str(st.secrets[name]).strip()
+    except Exception:
+        pass
+    return (os.environ.get(name) or "").strip() or None
 
 
-def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
-    r, g, b = rgb
-    return f"#{r:02x}{g:02x}{b:02x}"
+def http_get(url: str, params: dict, timeout: int = 30) -> dict:
+    headers = {"User-Agent": UA}
+    for attempt in range(6):
+        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        if r.status_code == 429:
+            retry = r.headers.get("Retry-After")
+            sleep_s = int(retry) if retry and retry.isdigit() else (1 + attempt * 2)
+            time.sleep(sleep_s)
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError(f"Too many requests for {url}")
 
 
-def blend_hex(fg_hex: str, bg_hex: str, fg_strength: float) -> str:
-    fg_strength = float(np.clip(fg_strength, 0.0, 1.0))
-    fr, fg, fb = hex_to_rgb(fg_hex)
-    br, bg, bb = hex_to_rgb(bg_hex)
-    r = int(round(br + (fr - br) * fg_strength))
-    g = int(round(bg + (fg - bg) * fg_strength))
-    b = int(round(bb + (fb - bb) * fg_strength))
-    return rgb_to_hex((r, g, b))
+def spotify_get_token() -> Optional[str]:
+    client_id = safe_get_secret("SPOTIFY_CLIENT_ID")
+    client_secret = safe_get_secret("SPOTIFY_CLIENT_SECRET")
+    if not client_id or not client_secret:
+        return None
+
+    auth = requests.auth.HTTPBasicAuth(client_id, client_secret)
+    data = {"grant_type": "client_credentials"}
+    headers = {"User-Agent": UA}
+
+    for attempt in range(6):
+        r = requests.post(SPOTIFY_TOKEN_URL, data=data, auth=auth, headers=headers, timeout=30)
+        if r.status_code == 429:
+            retry = r.headers.get("Retry-After")
+            sleep_s = int(retry) if retry and retry.isdigit() else (1 + attempt * 2)
+            time.sleep(sleep_s)
+            continue
+        r.raise_for_status()
+        return r.json().get("access_token")
+    return None
 
 
-# =========================
+def spotify_api_get(path: str, token: str, params: dict | None = None, timeout: int = 30) -> dict:
+    headers = {"Authorization": f"Bearer {token}", "User-Agent": UA}
+    url = f"{SPOTIFY_API}{path}"
+    for attempt in range(6):
+        r = requests.get(url, params=params or {}, headers=headers, timeout=timeout)
+        if r.status_code == 429:
+            retry = r.headers.get("Retry-After")
+            sleep_s = int(retry) if retry and retry.isdigit() else (1 + attempt * 2)
+            time.sleep(sleep_s)
+            continue
+        r.raise_for_status()
+        return r.json()
+    raise RuntimeError(f"Spotify GET failed: {path}")
+
+
+def spotify_search_artist(token: str, name: str, market: str) -> Optional[dict]:
+    js = spotify_api_get(
+        "/search",
+        token,
+        params={"q": name, "type": "artist", "limit": 3, "market": market},
+        timeout=30,
+    )
+    items = js.get("artists", {}).get("items", [])
+    if not items:
+        return None
+
+    # Prefer exact-ish match
+    n = norm_title(name)
+    for a in items:
+        if norm_title(a.get("name", "")) == n:
+            return a
+    return items[0]
+
+
+def spotify_top_track_for_artist(token: str, artist_id: str, market: str) -> Optional[dict]:
+    js = spotify_api_get(f"/artists/{artist_id}/top-tracks", token, params={"market": market}, timeout=30)
+    tracks = js.get("tracks", [])
+    return tracks[0] if tracks else None
+
+
+def spotify_search_track(token: str, query: str, market: str) -> Optional[dict]:
+    js = spotify_api_get(
+        "/search",
+        token,
+        params={"q": query, "type": "track", "limit": 5, "market": market},
+        timeout=30,
+    )
+    items = js.get("tracks", {}).get("items", [])
+    return items[0] if items else None
+
+
+def spotify_embed_html(track_id: str) -> str:
+    # Use embed for a track (works without Web Playback SDK)
+    return f"""
+    <iframe style="border-radius:12px"
+      src="https://open.spotify.com/embed/track/{track_id}?utm_source=generator"
+      width="100%" height="152" frameborder="0"
+      allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+      loading="lazy"></iframe>
+    """
+
+
+# ----------------------------
 # Data loading
-# =========================
+# ----------------------------
 @st.cache_data(show_spinner=False)
-def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.DataFrame:
-    if source == "web":
-        df = pd.read_csv(DATA_URL)
+def load_genre_data_from_repo() -> pd.DataFrame:
+    base = Path(__file__).resolve().parent
+    path = base / "data" / "genre_attrs.csv"
+    if not path.exists():
+        raise FileNotFoundError("Missing data/genre_attrs.csv in the repo.")
+
+    df = pd.read_csv(path)
+
+    # Normalize expected columns
+    # Expected (from Every Noise–derived exports): genre, x, y, r, g, b
+    colmap = {c.lower(): c for c in df.columns}
+
+    def pick(name: str) -> Optional[str]:
+        return colmap.get(name)
+
+    genre_col = pick("genre") or pick("name")
+    x_col = pick("x")
+    y_col = pick("y")
+
+    if not genre_col or not x_col or not y_col:
+        raise ValueError("CSV must contain at least: genre, x, y columns.")
+
+    df = df.rename(columns={genre_col: "genre", x_col: "x", y_col: "y"})
+
+    # Colors: either r/g/b columns or a single hex column
+    r_col, g_col, b_col = pick("r"), pick("g"), pick("b")
+    if r_col and g_col and b_col:
+        df = df.rename(columns={r_col: "r", g_col: "g", b_col: "b"})
     else:
-        if uploaded_bytes is None:
-            raise ValueError("No uploaded file provided.")
-        df = pd.read_csv(uploaded_bytes)
+        # If no rgb provided, create a pleasant default color
+        df["r"], df["g"], df["b"] = 180, 180, 180
 
-    required = {"genre", "x", "y"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns: {missing}. Found: {list(df.columns)}")
-
-    df = df.dropna(subset=["genre", "x", "y"]).copy()
-    df["genre"] = df["genre"].astype(str)
-
+    # Ensure numeric
     df["x"] = pd.to_numeric(df["x"], errors="coerce")
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
-    df = df.dropna(subset=["x", "y"]).copy()
+    df["r"] = pd.to_numeric(df["r"], errors="coerce").fillna(180).astype(int)
+    df["g"] = pd.to_numeric(df["g"], errors="coerce").fillna(180).astype(int)
+    df["b"] = pd.to_numeric(df["b"], errors="coerce").fillna(180).astype(int)
 
-    # Colors: either r,g,b or a hex column
-    if {"r", "g", "b"}.issubset(df.columns):
-        for c in ["r", "g", "b"]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        df = df.dropna(subset=["r", "g", "b"]).copy()
-        df["r"] = df["r"].clip(0, 255).astype(int)
-        df["g"] = df["g"].clip(0, 255).astype(int)
-        df["b"] = df["b"].clip(0, 255).astype(int)
-        df["hex_colour"] = (
-            "#" + df["r"].map(lambda v: f"{v:02x}")
-            + df["g"].map(lambda v: f"{v:02x}")
-            + df["b"].map(lambda v: f"{v:02x}")
-        )
-    else:
-        hex_col = None
-        for c in ["hex_colour", "hex_color", "hex", "color", "colour"]:
-            if c in df.columns:
-                hex_col = c
-                break
-        df["hex_colour"] = df[hex_col] if hex_col else "#888888"
+    df = df.dropna(subset=["x", "y"]).reset_index(drop=True)
+    df["genre"] = df["genre"].astype(str)
 
-    df["hex_colour"] = df["hex_colour"].apply(safe_hex)
-    return df.reset_index(drop=True)
+    # Convenience: hex color for Plotly
+    df["hex"] = df.apply(lambda row: f"rgb({int(row.r)},{int(row.g)},{int(row.b)})", axis=1)
+
+    return df
 
 
 @st.cache_data(show_spinner=False)
-def stable_label_sample(genres: pd.Series, n: int = 140) -> List[int]:
-    hashes = genres.astype(str).apply(lambda s: zlib.crc32(s.encode("utf-8")))
-    picked = hashes.nsmallest(min(n, len(genres))).index.tolist()
-    return picked
+def load_wiki_title_maps() -> tuple[dict[str, str], dict[str, str]]:
+    """
+    Returns (overrides_map, generated_map)
+    Keys are normalized genre names; values are Wikipedia page titles.
+    """
+    base = Path(__file__).resolve().parent
+    overrides_path = base / "data" / "wiki_overrides.csv"
+    map_path = base / "data" / "wiki_map.csv"
+
+    overrides: dict[str, str] = {}
+    generated: dict[str, str] = {}
+
+    if overrides_path.exists():
+        odf = pd.read_csv(overrides_path)
+        if "genre" in odf.columns and "wiki_title" in odf.columns:
+            for _, row in odf.iterrows():
+                g = norm_title(str(row.get("genre", "")))
+                t = str(row.get("wiki_title", "")).strip()
+                if g and t:
+                    overrides[g] = t
+
+    if map_path.exists():
+        mdf = pd.read_csv(map_path)
+        if "genre" in mdf.columns and "wiki_title" in mdf.columns:
+            for _, row in mdf.iterrows():
+                g = norm_title(str(row.get("genre", "")))
+                t = str(row.get("wiki_title", "")).strip()
+                if g and t:
+                    generated[g] = t
+
+    return overrides, generated
 
 
+# ----------------------------
+# Wikipedia fetch (by title)
+# ----------------------------
 @st.cache_data(show_spinner=False)
-def build_knn_graph(coords: np.ndarray, k: int):
-    n = coords.shape[0]
-    k = max(1, min(k, n - 1))
-    nn = NearestNeighbors(n_neighbors=k + 1, algorithm="auto")
-    nn.fit(coords)
-    distances, indices = nn.kneighbors(coords)
-
-    adj: List[List[Tuple[int, float]]] = [[] for _ in range(n)]
-    edges: List[Tuple[int, int, float]] = []
-
-    for u in range(n):
-        for pos in range(1, k + 1):
-            v = int(indices[u, pos])
-            d = float(distances[u, pos])
-            adj[u].append((v, d))
-            adj[v].append((u, d))
-            if u < v:
-                edges.append((u, v, d))
-    return adj, edges
-
-
-def dijkstra_path(adj: List[List[Tuple[int, float]]], start: int, goal: int) -> List[int]:
-    if start == goal:
-        return [start]
-    INF = 1e18
-    dist = {start: 0.0}
-    prev: Dict[int, int] = {}
-    pq = [(0.0, start)]
-
-    while pq:
-        d, u = heapq.heappop(pq)
-        if u == goal:
-            break
-        if d != dist.get(u, INF):
-            continue
-        for v, w in adj[u]:
-            nd = d + w
-            if nd < dist.get(v, INF):
-                dist[v] = nd
-                prev[v] = u
-                heapq.heappush(pq, (nd, v))
-
-    if goal not in dist:
-        return []
-
-    path = [goal]
-    while path[-1] != start:
-        path.append(prev[path[-1]])
-    path.reverse()
-    return path
-
-
-# =========================
-# Wikipedia (better matching)
-# =========================
-def _fetch_page_intro_by_title(title: str) -> Dict[str, Optional[str]]:
-    headers = {"User-Agent": WIKI_UA}
-    r = requests.get(
+def wiki_intro_by_title(title: str) -> dict:
+    js = http_get(
         WIKI_API,
         params={
             "action": "query",
-            "prop": "extracts|info",
+            "prop": "extracts",
             "exintro": 1,
             "explaintext": 1,
-            "inprop": "url",
             "redirects": 1,
             "titles": title,
             "format": "json",
         },
-        headers=headers,
-        timeout=15,
+        timeout=30,
     )
-    r.raise_for_status()
-    js = r.json()
     pages = js.get("query", {}).get("pages", {})
     page = next(iter(pages.values())) if pages else {}
-    if page.get("missing") is not None:
-        return {"title": None, "paragraph": None, "url": None}
-
+    t = page.get("title")
     extract = (page.get("extract") or "").strip()
-    paragraph = extract.split("\n")[0].strip() if extract else None
-    url = page.get("fullurl")
-    return {"title": page.get("title"), "paragraph": paragraph, "url": url}
+    paragraph = extract.split("\n")[0].strip() if extract else ""
+    url = f"https://en.wikipedia.org/wiki/{t.replace(' ', '_')}" if t else ""
+    return {"title": t or title, "paragraph": paragraph, "url": url}
 
 
-def _fetch_lead_html(title: str) -> Optional[str]:
-    headers = {"User-Agent": WIKI_UA}
-    r = requests.get(
+@st.cache_data(show_spinner=False)
+def wiki_lead_html(title: str) -> str:
+    # Get HTML for first section (lead) so we can pull linked names (often artists/bands)
+    js = http_get(
         WIKI_API,
         params={
             "action": "parse",
@@ -245,850 +285,702 @@ def _fetch_lead_html(title: str) -> Optional[str]:
             "prop": "text",
             "section": 0,
             "format": "json",
-            "redirects": 1,
         },
-        headers=headers,
-        timeout=15,
+        timeout=30,
     )
-    r.raise_for_status()
-    js = r.json()
-    return js.get("parse", {}).get("text", {}).get("*")
+    return (js.get("parse", {}).get("text", {}).get("*") or "")
 
 
-def _extract_first_paragraph_links(lead_html: str) -> List[str]:
-    if not lead_html:
+def extract_first_paragraph_link_titles(html: str, max_items: int = 25) -> List[str]:
+    """
+    Very lightweight parsing: pull link titles from the first <p>...</p>.
+    We don't need perfect HTML parsing here.
+    """
+    if not html:
         return []
-    ps = re.findall(r"<p>(.*?)</p>", lead_html, flags=re.DOTALL | re.IGNORECASE)
-    first_p = None
-    for p in ps:
-        plain = strip_tags(p)
-        if len(plain) > 60:
-            first_p = p
+
+    # First paragraph block
+    m = re.search(r"<p[^>]*>(.*?)</p>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+
+    p = m.group(1)
+
+    # Extract title="..." or /wiki/...
+    titles: List[str] = []
+    for tm in re.finditer(r'title="([^"]+)"', p):
+        t = tm.group(1)
+        if t and t not in titles:
+            titles.append(t)
+        if len(titles) >= max_items:
             break
-    if not first_p:
-        return []
 
-    anchors = re.findall(r'<a[^>]*title="([^"]+)"[^>]*>(.*?)</a>', first_p, flags=re.DOTALL | re.IGNORECASE)
-    names = []
-    for title_attr, inner in anchors:
-        t = strip_tags(inner)
-        ta = strip_tags(title_attr)
-        if not t:
-            continue
-        if ":" in ta or ta.lower().startswith("list of "):
-            continue
-        names.append(t)
+    # Fallback: /wiki/Name
+    if not titles:
+        for wm in re.finditer(r'href="/wiki/([^"#?]+)"', p):
+            t = wm.group(1).replace("_", " ")
+            if t and t not in titles:
+                titles.append(t)
+            if len(titles) >= max_items:
+                break
 
-    out = []
-    seen = set()
-    for n in names:
-        k = n.strip()
-        if k and k not in seen:
-            seen.add(k)
-            out.append(k)
-    return out
+    return titles[:max_items]
 
 
-def _looks_like_music(paragraph: str) -> bool:
-    if not paragraph:
-        return False
-    p = paragraph.lower()
-    # Must contain at least one music-ish hint
-    if not any(t in p for t in MUSIC_TERMS):
-        return False
-    # Strong penalty for “place” pages unless they also very clearly talk about music
-    if any(t in p for t in PLACE_TERMS) and "music" not in p and "musical" not in p:
-        return False
-    return True
+def resolve_wiki_title_for_genre(genre: str) -> Optional[str]:
+    overrides_map, generated_map = load_wiki_title_maps()
+    key = norm_title(genre)
+    return overrides_map.get(key) or generated_map.get(key)
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
-def fetch_wikipedia_lead(genre_name: str) -> Dict[str, object]:
-    headers = {"User-Agent": WIKI_UA}
-    g = (genre_name or "").strip()
-    if not g:
-        return {"title": None, "paragraph": None, "url": None, "lead_link_names": []}
+def pick_spotify_example_from_wikipedia(token: Optional[str], wiki_title: str, market: str) -> Optional[dict]:
+    """
+    Tries to choose an artist mentioned in the first paragraph.
+    If that fails, falls back to a track search using the genre title.
+    Returns a Spotify track object (dict) or None.
+    """
+    if not token:
+        return None
 
-    banned_titles = {
-        "music genre",
-        "music",
-        "genre",
-        "popular music",
-        "list of genres",
-        "outline of music",
-    }
-
-    def title_score(t: str) -> int:
-        ng = norm_title(g)
-        nt = norm_title(t)
-        if not nt or nt in banned_titles:
-            return -9999
-
-        score = 0
-        if nt == ng:
-            score += 120
-        if ng and ng in nt:
-            score += 80
-
-        # Prefer pages that explicitly say music/genre in the title
-        if "music" in nt:
-            score += 35
-        if "genre" in nt:
-            score += 25
-        if "style" in nt:
-            score += 15
-
-        # Small boost if all words appear
-        toks = ng.split()
-        if toks and all(tok in nt for tok in toks):
-            score += 30
-
-        return score
-
-    best = {"title": None, "paragraph": None, "url": None}
-    best_score = -9999
-
-    # Try direct title first
     try:
-        direct = _fetch_page_intro_by_title(g)
-        if direct.get("title") and norm_title(direct["title"]) not in banned_titles:
-            if direct.get("paragraph") and _looks_like_music(direct["paragraph"]):
-                best = direct
-                best_score = 999
+        html = wiki_lead_html(wiki_title)
+        link_titles = extract_first_paragraph_link_titles(html, max_items=25)
+    except Exception:
+        link_titles = []
+
+    # Filter obvious non-artist links
+    bad_words = [
+        "music", "genre", "style", "history", "list", "album", "song", "record",
+        "city", "state", "country", "united states", "england", "australia"
+    ]
+    filtered = []
+    for t in link_titles:
+        tl = norm_title(t)
+        if any(bw in tl for bw in bad_words):
+            continue
+        # Skip very long titles (usually not artist names)
+        if len(t) > 45:
+            continue
+        filtered.append(t)
+
+    # Try top ~12 candidates for an artist match
+    for name in filtered[:12]:
+        try:
+            artist = spotify_search_artist(token, name, market=market)
+            if artist and artist.get("id"):
+                top = spotify_top_track_for_artist(token, artist["id"], market=market)
+                if top and top.get("id"):
+                    # Attach artist name for display
+                    top["_picked_from_artist"] = artist.get("name")
+                    return top
+        except Exception:
+            continue
+
+    # Fallback: just search a track with the wiki title
+    try:
+        tr = spotify_search_track(token, f"{wiki_title}", market=market)
+        if tr and tr.get("id"):
+            return tr
     except Exception:
         pass
 
-    # Search queries (music-weighted)
-    queries = [
-        f'intitle:"{g}" (music OR genre OR style)',
-        f'"{g}" (music OR genre OR style)',
-        f'{g} music genre',
-        f'{g} musical style',
-    ]
-
-    candidates: List[str] = []
-    for q in queries:
-        try:
-            r = requests.get(
-                WIKI_API,
-                params={"action": "query", "list": "search", "srsearch": q, "srlimit": 8, "format": "json"},
-                headers=headers,
-                timeout=15,
-            )
-            r.raise_for_status()
-            hits = r.json().get("query", {}).get("search", [])
-            for h in hits:
-                t = h.get("title")
-                if t:
-                    candidates.append(t)
-        except Exception:
-            continue
-
-    # Dedup
-    seen = set()
-    cand_titles = []
-    for t in candidates:
-        if t not in seen:
-            seen.add(t)
-            cand_titles.append(t)
-
-    # Evaluate candidates by pulling their intro and scoring
-    for t in cand_titles[:20]:
-        try:
-            page = _fetch_page_intro_by_title(t)
-            para = page.get("paragraph")
-            if not para:
-                continue
-            if norm_title(page.get("title") or "") in banned_titles:
-                continue
-            if not _looks_like_music(para):
-                continue
-
-            s = title_score(page.get("title") or t)
-
-            # Bonus if paragraph explicitly mentions “genre” or “style”
-            pl = para.lower()
-            if "genre" in pl:
-                s += 20
-            if "musical style" in pl or "style of" in pl:
-                s += 15
-
-            if s > best_score:
-                best = page
-                best_score = s
-        except Exception:
-            continue
-
-    # Extract lead paragraph links for picking an artist example
-    lead_links: List[str] = []
-    if best.get("title"):
-        try:
-            lead_html = _fetch_lead_html(best["title"])
-            lead_links = _extract_first_paragraph_links(lead_html or "")
-        except Exception:
-            lead_links = []
-
-    return {
-        "title": best.get("title"),
-        "paragraph": best.get("paragraph"),
-        "url": best.get("url"),
-        "lead_link_names": lead_links,
-    }
-
-
-# =========================
-# Spotify API
-# =========================
-def _get_spotify_creds() -> Tuple[Optional[str], Optional[str]]:
-    try:
-        return st.secrets.get("SPOTIFY_CLIENT_ID"), st.secrets.get("SPOTIFY_CLIENT_SECRET")
-    except Exception:
-        return None, None
-
-
-def get_spotify_token() -> Optional[str]:
-    now = time.time()
-    tok = st.session_state.get("spotify_token")
-    exp = st.session_state.get("spotify_token_exp", 0.0)
-    if tok and now < exp - 60:
-        return tok
-
-    client_id, client_secret = _get_spotify_creds()
-    if not client_id or not client_secret:
-        return None
-
-    auth = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("utf-8")
-    try:
-        r = requests.post(
-            SPOTIFY_TOKEN_URL,
-            data={"grant_type": "client_credentials"},
-            headers={"Authorization": f"Basic {auth}"},
-            timeout=15,
-        )
-        r.raise_for_status()
-        js = r.json()
-        tok = js.get("access_token")
-        expires_in = float(js.get("expires_in", 3600))
-        if not tok:
-            return None
-        st.session_state["spotify_token"] = tok
-        st.session_state["spotify_token_exp"] = time.time() + expires_in
-        return tok
-    except Exception:
-        return None
-
-
-def spotify_search_artist(name: str, market: str = "AU") -> Optional[Dict[str, str]]:
-    tok = get_spotify_token()
-    if not tok:
-        return None
-    headers = {"Authorization": f"Bearer {tok}"}
-    try:
-        r = requests.get(
-            SPOTIFY_SEARCH_URL,
-            params={"q": f'artist:"{name}"', "type": "artist", "limit": 1, "market": market},
-            headers=headers,
-            timeout=15,
-        )
-        r.raise_for_status()
-        items = r.json().get("artists", {}).get("items", [])
-        if not items:
-            return None
-        a = items[0]
-        return {
-            "type": "artist",
-            "id": a["id"],
-            "name": a.get("name", name),
-            "url": a.get("external_urls", {}).get("spotify", ""),
-        }
-    except Exception:
-        return None
-
-
-def spotify_artist_from_wikipedia_links(link_names: List[str], market: str = "AU") -> Optional[Dict[str, str]]:
-    if not link_names:
-        return None
-
-    blacklist = {
-        "music", "genre", "rock", "jazz", "pop", "hip hop", "hip-hop", "blues",
-        "united states", "england", "australia", "british", "american",
-        "song", "album", "record", "band", "singer", "musician",
-    }
-
-    def candidate_score(n: str) -> int:
-        nn = norm_title(n)
-        if not nn or nn in blacklist:
-            return -9999
-        if len(nn) < 3 or len(nn) > 45:
-            return -9999
-        words = nn.split()
-        if 2 <= len(words) <= 4:
-            return 100
-        if len(words) == 1:
-            return 55
-        return 25
-
-    ranked = sorted(link_names, key=candidate_score, reverse=True)
-    ranked = [n for n in ranked if candidate_score(n) > 0][:10]
-
-    for name in ranked:
-        a = spotify_search_artist(name, market=market)
-        if not a:
-            continue
-        if norm_title(a["name"]) == norm_title(name) or norm_title(name) in norm_title(a["name"]):
-            return a
-
-    for name in ranked:
-        a = spotify_search_artist(name, market=market)
-        if a:
-            return a
     return None
 
 
-def spotify_embed_html(item_type: str, item_id: str, height: int = 152) -> str:
-    if item_type not in {"track", "playlist", "artist"}:
-        item_type = "track"
-    src = f"https://open.spotify.com/embed/{item_type}/{item_id}"
-    return f"""
-      <iframe style="border-radius:12px"
-        src="{src}"
-        width="100%" height="{height}" frameborder="0"
-        allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-        loading="lazy"></iframe>
+# ----------------------------
+# Nearest neighbors + path
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def compute_neighbors(xy: np.ndarray, k: int) -> List[List[int]]:
     """
+    Returns neighbors list for each point.
+    Tries sklearn if available, else uses a numpy chunk fallback.
+    """
+    n = xy.shape[0]
+    k = int(clamp(k, 1, 25))
+
+    # sklearn fast path
+    try:
+        from sklearn.neighbors import NearestNeighbors  # type: ignore
+        nn = NearestNeighbors(n_neighbors=min(k + 1, n), algorithm="auto")
+        nn.fit(xy)
+        dists, idxs = nn.kneighbors(xy, return_distance=True)
+        # drop self at position 0
+        out = [list(row[1:]) for row in idxs]
+        return out
+    except Exception:
+        pass
+
+    # numpy fallback (chunked)
+    xy_f = xy.astype(np.float32)
+    out: List[List[int]] = []
+    for i in range(n):
+        d = np.sum((xy_f - xy_f[i]) ** 2, axis=1)
+        # partial sort
+        idx = np.argpartition(d, min(k + 1, n - 1))[: min(k + 1, n)]
+        idx = idx[idx != i]
+        # sort those by distance
+        idx = idx[np.argsort(d[idx])][:k]
+        out.append(idx.astype(int).tolist())
+    return out
 
 
-# =========================
-# History
-# =========================
-def push_history(genre: str, max_len: int = 20):
-    if not genre or genre == NONE_OPTION:
+def build_adjacency(neighbors: List[List[int]]) -> List[List[int]]:
+    n = len(neighbors)
+    adj = [[] for _ in range(n)]
+    for i, nbrs in enumerate(neighbors):
+        for j in nbrs:
+            if j not in adj[i]:
+                adj[i].append(j)
+            if i not in adj[j]:
+                adj[j].append(i)
+    return adj
+
+
+def shortest_path(adj: List[List[int]], start: int, goal: int) -> List[int]:
+    if start == goal:
+        return [start]
+    n = len(adj)
+    prev = [-1] * n
+    q = deque([start])
+    prev[start] = start
+
+    while q:
+        cur = q.popleft()
+        for nxt in adj[cur]:
+            if prev[nxt] != -1:
+                continue
+            prev[nxt] = cur
+            if nxt == goal:
+                q.clear()
+                break
+            q.append(nxt)
+
+    if prev[goal] == -1:
+        return []
+
+    # Reconstruct
+    path = [goal]
+    while path[-1] != start:
+        path.append(prev[path[-1]])
+    path.reverse()
+    return path
+
+
+# ----------------------------
+# Label selection (so labels are readable)
+# ----------------------------
+@st.cache_data(show_spinner=False)
+def pick_label_points(df: pd.DataFrame, max_labels: int = 220) -> np.ndarray:
+    """
+    Pick a spread-out set of points to label in the default view.
+    (Grid sampling so labels don't all pile up.)
+    """
+    max_labels = int(clamp(max_labels, 50, 600))
+    x = df["x"].to_numpy()
+    y = df["y"].to_numpy()
+
+    # Grid bins
+    bins = int(np.sqrt(max_labels) * 1.6)
+    bins = int(clamp(bins, 10, 50))
+
+    x_min, x_max = float(x.min()), float(x.max())
+    y_min, y_max = float(y.min()), float(y.max())
+
+    gx = np.floor((x - x_min) / (x_max - x_min + 1e-9) * bins).astype(int)
+    gy = np.floor((y - y_min) / (y_max - y_min + 1e-9) * bins).astype(int)
+
+    chosen = {}
+    for idx in range(len(df)):
+        key = (gx[idx], gy[idx])
+        if key not in chosen:
+            chosen[key] = idx
+        if len(chosen) >= max_labels:
+            break
+
+    return np.array(list(chosen.values()), dtype=int)
+
+
+# ----------------------------
+# Session state
+# ----------------------------
+if "selected_genre" not in st.session_state:
+    st.session_state.selected_genre = ""  # empty means none
+if "destination_genre" not in st.session_state:
+    st.session_state.destination_genre = ""
+if "selection_history" not in st.session_state:
+    st.session_state.selection_history = []  # list[str]
+if "active_path" not in st.session_state:
+    st.session_state.active_path = []  # list[int]
+if "last_clicked_idx" not in st.session_state:
+    st.session_state.last_clicked_idx = None
+if "market" not in st.session_state:
+    st.session_state.market = "AU"
+
+UIREV = "genre-map-uirev-1"  # constant to preserve pan/zoom across reruns
+
+
+def push_history(genre: str, max_items: int = 12) -> None:
+    g = (genre or "").strip()
+    if not g:
         return
-    hist = st.session_state.setdefault("genre_history", [])
-    if len(hist) == 0 or hist[0] != genre:
-        hist = [genre] + [g for g in hist if g != genre]
-        st.session_state["genre_history"] = hist[:max_len]
+    hist = st.session_state.selection_history
+    if g in hist:
+        hist.remove(g)
+    hist.insert(0, g)
+    st.session_state.selection_history = hist[:max_items]
 
 
-# =========================
-# Figure helpers
-# =========================
-def build_edges_xy(X: np.ndarray, Y: np.ndarray, edges: List[Tuple[int, int, float]]) -> Tuple[List[float], List[float]]:
-    xs, ys = [], []
-    for u, v, _d in edges:
-        xs.extend([float(X[u]), float(X[v]), None])
-        ys.extend([float(Y[u]), float(Y[v]), None])
-    return xs, ys
-
-
-def build_star_xy(X: np.ndarray, Y: np.ndarray, center_idx: int, adj: List[List[Tuple[int, float]]]) -> Tuple[List[float], List[float]]:
-    sx, sy = float(X[center_idx]), float(Y[center_idx])
-    xs, ys = [], []
-    for v, _d in adj[center_idx]:
-        xs.extend([sx, float(X[v]), None])
-        ys.extend([sy, float(Y[v]), None])
-    return xs, ys
-
-
-def build_path_xy(X: np.ndarray, Y: np.ndarray, path: List[int]) -> Tuple[List[float], List[float]]:
-    xs, ys = [], []
-    for a, b in zip(path[:-1], path[1:]):
-        xs.extend([float(X[a]), float(X[b]), None])
-        ys.extend([float(Y[a]), float(Y[b]), None])
-    return xs, ys
-
-
-def make_figure(
-    df_plot: pd.DataFrame,
-    selected_idx: Optional[int],
-    neighbor_idxs: Set[int],
-    edges_all: List[Tuple[int, int, float]],
-    adj: List[List[Tuple[int, float]]],
-    show_edges: bool,
-    path: List[int],
-    show_labels: bool,
-    neighbor_label_count: int,
-    default_label_idxs: List[int],
-    label_size: int,
-    view_override: Optional[Tuple[Tuple[float, float], Tuple[float, float]]],
-    uirev: str,
-) -> go.Figure:
-    n = len(df_plot)
-    X = df_plot["x"].astype(float).to_numpy()
-    Y = df_plot["y"].astype(float).to_numpy()
-    C = df_plot["hex_colour"].to_numpy()
-    CF_SEL = df_plot["hex_faint_sel"].to_numpy()
-    CF_PATH = df_plot["hex_faint_path"].to_numpy()
-    G = df_plot["genre"].to_numpy()
-    IDX = np.arange(n)
-
-    has_selection = selected_idx is not None
-    has_path = len(path) >= 2
-
-    # Base colors
-    if not has_selection:
-        base_colors = C
+# ----------------------------
+# Sidebar
+# ----------------------------
+with st.sidebar:
+    st.markdown("## Selection history")
+    st.caption("Click dots or pick genres to build history.")
+    if st.session_state.selection_history:
+        for g in st.session_state.selection_history:
+            if st.button(g, use_container_width=True):
+                st.session_state.selected_genre = g
+                st.session_state.active_path = []
+                push_history(g)
+                st.rerun()
+        cols = st.columns([1, 1])
+        if cols[0].button("Clear", use_container_width=True):
+            st.session_state.selection_history = []
+            st.rerun()
+        cols[1].markdown(f"<div class='small-muted'>{len(st.session_state.selection_history)} saved</div>", unsafe_allow_html=True)
     else:
-        base_colors = CF_PATH if has_path else CF_SEL
+        st.markdown("<div class='small-muted'>No history yet.</div>", unsafe_allow_html=True)
 
-    # Highlight nodes
-    hi_idx: List[int] = []
-    if has_selection and not has_path:
-        hi_idx = sorted(set(list(neighbor_idxs) + [selected_idx]))
-    elif has_selection and has_path:
-        hi_idx = sorted(set([i for i in path if 0 <= i < n]))
+    st.markdown("---")
+    st.markdown("## Data")
+    st.caption("Genres come from your EveryNoise-derived CSV: data/genre_attrs.csv")
+    data_source = st.radio("Load dataset from:", ["Repo CSV (recommended)", "Upload CSV"], index=0)
 
-    # Highlight lines
-    hi_lx, hi_ly = [], []
-    if has_selection and show_edges:
-        if has_path:
-            hi_lx, hi_ly = build_path_xy(X, Y, [i for i in path if 0 <= i < n])
+    uploaded = None
+    if data_source == "Upload CSV":
+        uploaded = st.file_uploader("Upload CSV", type=["csv"])
+
+    st.markdown("---")
+    st.markdown("## Connections")
+    k = st.slider("Connections per genre (nearest neighbors)", min_value=2, max_value=20, value=8, step=1)
+    show_lines = st.checkbox("Show connection lines", value=True)
+    enable_path = st.checkbox("Enable path finder", value=True)
+
+    st.markdown("---")
+    st.markdown("## Spotify examples")
+    market = st.selectbox(
+        "Country/market",
+        ["AU", "US", "GB", "CA", "NZ", "DE", "FR", "BR", "JP"],
+        index=["AU", "US", "GB", "CA", "NZ", "DE", "FR", "BR", "JP"].index(st.session_state.market),
+    )
+    st.session_state.market = market
+
+    st.markdown("---")
+    st.markdown("## View")
+    map_fit = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
+
+
+# ----------------------------
+# Load data
+# ----------------------------
+try:
+    if data_source == "Upload CSV" and uploaded is not None:
+        df = pd.read_csv(uploaded)
+        # Normalize similarly to repo loader
+        colmap = {c.lower(): c for c in df.columns}
+        if "genre" not in colmap or "x" not in colmap or "y" not in colmap:
+            st.error("Uploaded CSV must include columns: genre, x, y (and optionally r,g,b).")
+            st.stop()
+        df = df.rename(columns={colmap["genre"]: "genre", colmap["x"]: "x", colmap["y"]: "y"})
+        if all(c in colmap for c in ["r", "g", "b"]):
+            df = df.rename(columns={colmap["r"]: "r", colmap["g"]: "g", colmap["b"]: "b"})
         else:
-            hi_lx, hi_ly = build_star_xy(X, Y, selected_idx, adj)
+            df["r"], df["g"], df["b"] = 180, 180, 180
+        df["x"] = pd.to_numeric(df["x"], errors="coerce")
+        df["y"] = pd.to_numeric(df["y"], errors="coerce")
+        df = df.dropna(subset=["x", "y"]).reset_index(drop=True)
+        df["hex"] = df.apply(lambda row: f"rgb({int(row.r)},{int(row.g)},{int(row.b)})", axis=1)
+    else:
+        df = load_genre_data_from_repo()
+except Exception as e:
+    st.error(f"Failed to load data: {e}")
+    st.stop()
 
-    # All edges
-    edges_x, edges_y = build_edges_xy(X, Y, edges_all)
+genres = df["genre"].tolist()
+genre_to_idx = {g: i for i, g in enumerate(genres)}
 
-    # Labels
-    label_x, label_y, label_t = [], [], []
-    if show_labels:
-        if not has_selection:
-            label_idxs = [i for i in default_label_idxs if 0 <= i < n]
-        else:
-            label_idxs: List[int] = []
-            if has_path:
-                if 0 <= path[0] < n:
-                    label_idxs.append(path[0])
-                if 0 <= path[-1] < n:
-                    label_idxs.append(path[-1])
+xy = df[["x", "y"]].to_numpy(dtype=np.float32)
+neighbors = compute_neighbors(xy, k=k)
+adj = build_adjacency(neighbors)
+
+label_idxs_default = pick_label_points(df, max_labels=240)
+
+# ----------------------------
+# Main layout
+# ----------------------------
+st.title("Phase 1 Prototype — Genre Map")
+
+col_left, col_mid, col_right = st.columns([0.33, 0.42, 0.25], gap="large")
+
+# ----------------------------
+# Controls (left main panel)
+# ----------------------------
+with col_left:
+    st.subheader("Controls")
+
+    search = st.text_input("Search genre", value="")
+
+    # Filter select options (but keep full list for stable indices)
+    if search.strip():
+        filtered = [g for g in genres if search.lower() in g.lower()]
+        if not filtered:
+            filtered = genres
+    else:
+        filtered = genres
+
+    options = ["(none)"] + filtered
+    # Keep widget key stable; do NOT set default + session state in a conflicting way
+    current = st.session_state.selected_genre
+    if current and current not in filtered and current in genres:
+        # ensure selected stays selectable
+        options = ["(none)"] + [current] + filtered
+
+    selected_label = current if current else "(none)"
+    sel = st.selectbox("Selected genre", options, index=options.index(selected_label), key="selected_genre_dropdown")
+    selected_genre = "" if sel == "(none)" else sel
+
+    if selected_genre != st.session_state.selected_genre:
+        st.session_state.selected_genre = selected_genre
+        st.session_state.active_path = []
+        if selected_genre:
+            push_history(selected_genre)
+
+    # Show closest genres
+    if st.session_state.selected_genre and st.session_state.selected_genre in genre_to_idx:
+        si = genre_to_idx[st.session_state.selected_genre]
+        close = [genres[j] for j in neighbors[si]]
+        st.markdown("**Closest genres**")
+        st.write(", ".join(close))
+
+    # Path finder
+    st.subheader("Path finder")
+    if enable_path and st.session_state.selected_genre and st.session_state.selected_genre in genre_to_idx:
+        st.text_input("Search destination", value="", key="dest_search")
+        dest_search = st.session_state.get("dest_search", "").strip().lower()
+        dest_filtered = [g for g in genres if dest_search in g.lower()] if dest_search else genres
+
+        dest_options = ["(none)"] + dest_filtered
+        current_dest = st.session_state.destination_genre
+        dest_label = current_dest if current_dest else "(none)"
+        if dest_label not in dest_options and current_dest in genres:
+            dest_options = ["(none)"] + [current_dest] + dest_filtered
+
+        dest_sel = st.selectbox("Destination genre", dest_options, index=dest_options.index(dest_label), key="dest_genre_dropdown")
+        destination = "" if dest_sel == "(none)" else dest_sel
+        st.session_state.destination_genre = destination
+
+        if st.button("Find shortest path", use_container_width=True):
+            start_idx = genre_to_idx[st.session_state.selected_genre]
+            if destination and destination in genre_to_idx:
+                end_idx = genre_to_idx[destination]
+                path = shortest_path(adj, start_idx, end_idx)
+                st.session_state.active_path = path
+                if path:
+                    st.success(f"Path found: {len(path)} steps.")
+                else:
+                    st.warning("No path found (graph may be disconnected at this k).")
             else:
-                label_idxs.append(selected_idx)
-                for i in sorted(list(neighbor_idxs))[:neighbor_label_count]:
-                    label_idxs.append(i)
-            label_idxs = sorted(set([i for i in label_idxs if 0 <= i < n]))
+                st.warning("Pick a destination genre first.")
+    else:
+        st.caption("Enable Path finder and select a genre to use this.")
 
-        label_x = [float(X[i]) for i in label_idxs]
-        label_y = [float(Y[i]) for i in label_idxs]
-        label_t = [str(G[i]) for i in label_idxs]
 
+# ----------------------------
+# Build Plotly figure (middle)
+# ----------------------------
+def build_edges_trace(edge_pairs: List[Tuple[int, int]], color: str, width: float, opacity: float) -> go.Scattergl:
+    xs = []
+    ys = []
+    for a, b in edge_pairs:
+        xs.extend([df.at[a, "x"], df.at[b, "x"], None])
+        ys.extend([df.at[a, "y"], df.at[b, "y"], None])
+    return go.Scattergl(
+        x=xs,
+        y=ys,
+        mode="lines",
+        line=dict(color=color, width=width),
+        opacity=opacity,
+        hoverinfo="skip",
+        showlegend=False,
+    )
+
+
+def build_map_figure() -> go.Figure:
+    n = len(df)
+
+    selected = st.session_state.selected_genre
+    selected_idx = genre_to_idx.get(selected) if selected else None
+    path_idxs = st.session_state.active_path or []
+
+    # Determine highlighting sets
+    highlight_nodes = set()
+    neighbor_nodes = set()
+
+    if selected_idx is not None:
+        highlight_nodes.add(selected_idx)
+        for j in neighbors[selected_idx]:
+            neighbor_nodes.add(j)
+
+    for p in path_idxs:
+        highlight_nodes.add(p)
+
+    # Marker styling
+    base_opacity = 0.18 if (selected_idx is not None or path_idxs) else 0.95
+    base_size = 5.5 if (selected_idx is not None or path_idxs) else 6.0
+
+    # Colors
+    colors = df["hex"].tolist()
+
+    # Base markers
+    marker_opacity = np.full(n, base_opacity, dtype=np.float32)
+    marker_size = np.full(n, base_size, dtype=np.float32)
+
+    # Make everything visible in default view
+    if selected_idx is None and not path_idxs:
+        marker_opacity[:] = 0.95
+        marker_size[:] = 6.0
+
+    # Highlight selected + neighbors + path
+    for idx in neighbor_nodes:
+        marker_opacity[idx] = 0.70
+        marker_size[idx] = 7.2
+
+    for idx in highlight_nodes:
+        marker_opacity[idx] = 0.98
+        marker_size[idx] = 9.0
+
+    # Labels:
+    label_idxs = set()
+    if selected_idx is None and not path_idxs:
+        label_idxs.update(label_idxs_default.tolist())
+    else:
+        if selected_idx is not None:
+            label_idxs.add(selected_idx)
+            label_idxs.update(list(neighbor_nodes)[:10])
+        label_idxs.update(path_idxs)
+
+    # Build traces
     fig = go.Figure()
 
-    # Edges (WebGL for smoothness)
+    # Edges
+    if show_lines:
+        # default edges (faint)
+        if selected_idx is None and not path_idxs:
+            edges = []
+            seen = set()
+            for i in range(n):
+                for j in neighbors[i]:
+                    a, b = (i, j) if i < j else (j, i)
+                    if (a, b) not in seen:
+                        seen.add((a, b))
+                        edges.append((a, b))
+            fig.add_trace(build_edges_trace(edges, color="rgba(120,150,255,0.35)", width=0.8, opacity=0.6))
+        else:
+            # Show local edges around selected + path (clear), keep others hidden
+            edges_local = []
+            seen = set()
+
+            focus = set()
+            if selected_idx is not None:
+                focus.add(selected_idx)
+                focus.update(neighbor_nodes)
+            focus.update(path_idxs)
+
+            for i in focus:
+                for j in neighbors[i]:
+                    a, b = (i, j) if i < j else (j, i)
+                    if (a, b) not in seen:
+                        seen.add((a, b))
+                        edges_local.append((a, b))
+
+            if edges_local:
+                fig.add_trace(build_edges_trace(edges_local, color="rgba(120,150,255,0.55)", width=1.1, opacity=0.85))
+
+            # Path edges thicker
+            if len(path_idxs) >= 2:
+                path_edges = list(zip(path_idxs[:-1], path_idxs[1:]))
+                fig.add_trace(build_edges_trace(path_edges, color="rgba(255,255,255,0.85)", width=2.6, opacity=0.95))
+
+    # Markers
     fig.add_trace(
         go.Scattergl(
-            x=edges_x,
-            y=edges_y,
-            mode="lines",
-            line=dict(
-                width=1.1,
-                color="rgba(150,180,255,0.34)" if not has_selection else "rgba(150,180,255,0.10)",
+            x=df["x"],
+            y=df["y"],
+            mode="markers",
+            marker=dict(
+                size=marker_size,
+                color=colors,
+                opacity=marker_opacity,
+                line=dict(width=0),
             ),
-            hoverinfo="skip",
+            hovertext=df["genre"],
+            hoverinfo="text",
             showlegend=False,
-            uid="edges_all",
-            visible=True if show_edges else False,
         )
     )
 
-    # Base points (WebGL)
-    fig.add_trace(
-        go.Scattergl(
-            x=X,
-            y=Y,
-            mode="markers",
-            marker=dict(size=9, color=base_colors, opacity=1.0),
-            text=G,
-            customdata=IDX,
-            hovertemplate="<b>%{text}</b><extra></extra>",
-            showlegend=False,
-            uid="points_base",
-        )
-    )
-
-    # Click targets (WebGL)
-    fig.add_trace(
-        go.Scattergl(
-            x=X,
-            y=Y,
-            mode="markers",
-            marker=dict(size=26, color="rgba(255,255,255,0.02)", opacity=0.02),
-            text=G,
-            customdata=IDX,
-            hovertemplate="<b>%{text}</b><extra></extra>",
-            showlegend=False,
-            uid="hit_targets",
-        )
-    )
-
-    # Highlight lines
-    fig.add_trace(
-        go.Scattergl(
-            x=hi_lx,
-            y=hi_ly,
-            mode="lines",
-            line=dict(width=4.0, color="rgba(120,200,255,0.92)"),
-            hoverinfo="skip",
-            showlegend=False,
-            uid="lines_highlight",
-        )
-    )
-
-    # Highlight points
-    if hi_idx:
+    # Labels trace (separate so it stays readable)
+    if label_idxs:
+        li = sorted(label_idxs)
         fig.add_trace(
             go.Scattergl(
-                x=X[hi_idx],
-                y=Y[hi_idx],
-                mode="markers",
-                marker=dict(size=13, color=C[hi_idx], opacity=1.0),
-                text=G[hi_idx],
-                customdata=IDX[hi_idx],
-                hovertemplate="<b>%{text}</b><extra></extra>",
+                x=df.loc[li, "x"],
+                y=df.loc[li, "y"],
+                mode="text",
+                text=df.loc[li, "genre"],
+                textposition="top center",
+                textfont=dict(size=10, color="rgba(255,255,255,0.85)"),
+                hoverinfo="skip",
                 showlegend=False,
-                uid="points_highlight",
             )
         )
-    else:
-        fig.add_trace(go.Scattergl(x=[], y=[], mode="markers", showlegend=False, uid="points_highlight"))
 
-    # Labels (regular Scatter works better for text than WebGL)
-    fig.add_trace(
-        go.Scatter(
-            x=label_x,
-            y=label_y,
-            mode="text",
-            text=label_t,
-            textposition="top center",
-            textfont=dict(size=label_size, color="rgba(255,255,255,0.92)"),
-            hoverinfo="skip",
-            showlegend=False,
-            uid="labels",
-        )
-    )
-
-    xaxis = dict(visible=False)
-    yaxis = dict(visible=False)
-    if view_override is not None:
-        (xmin, xmax), (ymin, ymax) = view_override
-        xaxis.update(range=[xmin, xmax])
-        yaxis.update(range=[ymin, ymax])
-
+    # Layout + preserve view
     fig.update_layout(
+        margin=dict(l=0, r=0, t=10, b=0),
         template="plotly_dark",
-        height=720,
-        margin=dict(l=10, r=10, t=10, b=10),
-        paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=xaxis,
-        yaxis=yaxis,
-        dragmode="pan",
-        clickmode="event+select",
+        height=620,
+        uirevision=UIREV,  # keeps zoom/pan stable across reruns
         hovermode="closest",
-        # This is what prevents “resetting” when the app reruns
-        uirevision=uirev,
     )
+
+    fig.update_xaxes(visible=False)
+    fig.update_yaxes(visible=False, scaleanchor="x", scaleratio=1)
+
     return fig
 
 
-def compute_zoom_box(df_plot: pd.DataFrame, idxs: List[int], pad_frac: float = 0.20):
-    xs = df_plot.loc[idxs, "x"].astype(float).to_numpy()
-    ys = df_plot.loc[idxs, "y"].astype(float).to_numpy()
-    xmin, xmax = float(xs.min()), float(xs.max())
-    ymin, ymax = float(ys.min()), float(ys.max())
-    dx = (xmax - xmin) or 1.0
-    dy = (ymax - ymin) or 1.0
-    xmin -= dx * pad_frac
-    xmax += dx * pad_frac
-    ymin -= dy * pad_frac
-    ymax += dy * pad_frac
-    return (xmin, xmax), (ymin, ymax)
-
-
-# =========================
-# App UI
-# =========================
-st.set_page_config(page_title="Phase 1: Genre Map", layout="wide")
-
-st.markdown(
-    """
-<style>
-div[data-baseweb="select"] * { cursor: pointer !important; }
-div[data-baseweb="select"] input { caret-color: transparent; }
-.js-plotly-plot, .js-plotly-plot * { cursor: pointer !important; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-st.title("Phase 1 Prototype — Genre Map")
-
-# Stable “don’t reset the view” ID for this session
-if "ui_rev" not in st.session_state:
-    st.session_state["ui_rev"] = str(uuid.uuid4())
-
-# Defaults
-if "selected_genre_dropdown" not in st.session_state:
-    st.session_state["selected_genre_dropdown"] = NONE_OPTION
-if "current_path" not in st.session_state:
-    st.session_state["current_path"] = []
-if "path_message" not in st.session_state:
-    st.session_state["path_message"] = ""
-if "view_override" not in st.session_state:
-    st.session_state["view_override"] = None  # only used when pressing Zoom/Reset buttons
-
-# Apply pending click selection BEFORE widgets are created
-pending = st.session_state.pop("pending_genre", None)
-if pending:
-    st.session_state["selected_genre_dropdown"] = pending
-    st.session_state["current_path"] = []
-    st.session_state["path_message"] = ""
-
-# Sidebar
-with st.sidebar:
-    st.header("Selection history")
-    hist = st.session_state.get("genre_history", [])
-    if not hist:
-        st.caption("Click dots or pick genres to build history.")
-    else:
-        for i, g in enumerate(hist[:12]):
-            if st.button(g, key=f"hist_{i}", use_container_width=True):
-                st.session_state["selected_genre_dropdown"] = g
-                st.session_state["current_path"] = []
-                st.session_state["path_message"] = ""
-                st.rerun()
-        cols = st.columns(2)
-        with cols[0]:
-            if st.button("Clear", use_container_width=True):
-                st.session_state["genre_history"] = []
-                st.session_state["selected_genre_dropdown"] = NONE_OPTION
-                st.session_state["current_path"] = []
-                st.session_state["path_message"] = ""
-                st.rerun()
-        with cols[1]:
-            st.caption(f"{len(hist)} saved")
-
-    st.divider()
-
-    st.header("Data")
-    source = st.radio("Load dataset from:", ["Web (recommended)", "Upload CSV"], index=0)
-    uploaded_bytes = None
-    if source == "Upload CSV":
-        uploaded = st.file_uploader("Upload genre CSV", type=["csv"])
-        if not uploaded:
-            st.stop()
-        uploaded_bytes = uploaded.getvalue()
-
-    st.divider()
-    st.header("Connections")
-    k = st.slider("Connections per genre", 2, 20, 8)
-    st.checkbox("Show connection lines", value=True, key="show_edges")
-    st.checkbox("Enable path finder", value=True, key="enable_path")
-
-    st.divider()
-    st.header("Labels")
-    show_labels = st.checkbox("Show map labels", value=True)
-    label_size = st.slider("Label size", 10, 20, 13)
-    neighbor_label_count = st.slider("Neighbor labels (when selected)", 0, 20, 6)
-
-    st.divider()
-    st.header("Spotify examples")
-    market = st.selectbox("Country/market", ["AU", "US", "GB", "CA", "NZ", "DE", "FR"], index=0)
-
-    st.divider()
-    st.header("View")
-    view_mode = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
-
-# Load data
-df = load_genre_data("upload" if source == "Upload CSV" else "web", uploaded_bytes)
-
-# Prepare plot coords
-df_plot = df.copy()
-if view_mode == "Fit to screen":
-    x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
-    y_min, y_max = df_plot["y"].min(), df_plot["y"].max()
-    if x_max != x_min:
-        df_plot["x"] = (df_plot["x"] - x_min) / (x_max - x_min)
-    if y_max != y_min:
-        df_plot["y"] = (df_plot["y"] - y_min) / (y_max - y_min)
-
-# Faint colors (crisp)
-# NOTE: A bit less faint than before to avoid “blur/washed out” feeling.
-df_plot["hex_faint_sel"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.38))
-df_plot["hex_faint_path"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.26))
-
-coords = df_plot[["x", "y"]].to_numpy(dtype=float)
-adj, undirected_edges = build_knn_graph(coords, k=k)
-
-default_label_idxs = stable_label_sample(df_plot["genre"], n=140)
-
-col_controls, col_map, col_details = st.columns([1.15, 2.2, 1.35], gap="large")
-
-# ---------------- Controls column ----------------
-with col_controls:
-    st.subheader("Controls")
-
-    q = st.text_input("Search genre", value="", key="start_query")
-    if q.strip():
-        mask = df["genre"].str.contains(q.strip(), case=False, na=False)
-        candidates = df.loc[mask, "genre"].tolist()
-    else:
-        candidates = df["genre"].head(800).tolist()
-
-    cur = st.session_state.get("selected_genre_dropdown", NONE_OPTION)
-    options = [NONE_OPTION] + candidates
-    if cur != NONE_OPTION and cur not in options and cur in df["genre"].values:
-        options = [NONE_OPTION, cur] + candidates
-
-    chosen = st.selectbox("Selected genre", options, key="selected_genre_dropdown")
-
-    # Clear path whenever selection changes
-    if st.session_state.get("prev_dropdown") != chosen:
-        st.session_state["prev_dropdown"] = chosen
-        st.session_state["current_path"] = []
-        st.session_state["path_message"] = ""
-
-    if chosen != NONE_OPTION:
-        push_history(chosen)
-        selected_idx = int(df.index[df["genre"] == chosen][0])
-        neighbor_idxs = {v for v, _d in adj[selected_idx]}
-
-        neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
-        st.caption("Closest genres")
-        st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
-    else:
-        selected_idx = None
-        neighbor_idxs = set()
-        st.caption("Closest genres")
-        st.write("Select a genre to show its nearest neighbors.")
-
-    st.markdown("### Zoom (faster than scroll wheel)")
-    zc1, zc2 = st.columns(2)
-    with zc1:
-        if st.button("Zoom to selected", use_container_width=True, disabled=(chosen == NONE_OPTION)):
-            idxs = [selected_idx] + sorted(list(neighbor_idxs))[:min(20, len(neighbor_idxs))]
-            st.session_state["view_override"] = compute_zoom_box(df_plot, idxs, pad_frac=0.28)
-            # Changing uirevision forces Plotly to adopt the new range
-            st.session_state["ui_rev"] = str(uuid.uuid4())
-            st.rerun()
-    with zc2:
-        if st.button("Reset view", use_container_width=True):
-            st.session_state["view_override"] = None
-            st.session_state["ui_rev"] = str(uuid.uuid4())
-            st.rerun()
-
-    if st.session_state.get("enable_path", True):
-        st.markdown("### Path finder")
-        if chosen == NONE_OPTION:
-            st.info("Pick a start genre first, then you can find a path.")
-        else:
-            dest_q = st.text_input("Search destination", value="", key="dest_query")
-            if dest_q.strip():
-                dest_mask = df["genre"].str.contains(dest_q.strip(), case=False, na=False)
-                end_candidates = df.loc[dest_mask, "genre"].tolist()
-            else:
-                end_candidates = stable_label_sample(df["genre"], n=500)
-                end_candidates = df.loc[end_candidates, "genre"].tolist()
-
-            if end_candidates:
-                end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
-                if st.button("Find shortest path"):
-                    end_idx = int(df.index[df["genre"] == end][0])
-                    path = dijkstra_path(adj, selected_idx, end_idx)
-                    st.session_state["current_path"] = path
-                    st.session_state["path_message"] = (
-                        f"Path found: {len(path)} steps." if path else "No path found. Try increasing connections."
-                    )
-                    st.rerun()
-
-    if st.session_state.get("path_message"):
-        if st.session_state["current_path"]:
-            st.success(st.session_state["path_message"])
-        else:
-            st.error(st.session_state["path_message"])
-
-# ---------------- Map column ----------------
-with col_map:
+with col_mid:
     st.subheader("Map (click a dot)")
+    fig = build_map_figure()
 
-    fig = make_figure(
-        df_plot=df_plot,
-        selected_idx=selected_idx,
-        neighbor_idxs=neighbor_idxs,
-        edges_all=undirected_edges,
-        adj=adj,
-        show_edges=st.session_state.get("show_edges", True),
-        path=st.session_state.get("current_path", []),
-        show_labels=show_labels,
-        neighbor_label_count=neighbor_label_count,
-        default_label_idxs=default_label_idxs,
-        label_size=label_size,
-        view_override=st.session_state.get("view_override"),
-        uirev=st.session_state["ui_rev"],
-    )
+    # Streamlit selection event (works for point clicks when clickmode includes select)
+    fig.update_layout(clickmode="event+select", dragmode="pan")
 
-    event = st.plotly_chart(
-        fig,
-        key="genre_map",
-        on_select="rerun",
-        selection_mode="points",
-        config={"scrollZoom": True, "doubleClick": "reset", "displaylogo": False, "responsive": True},
-    )
+    config = {
+        "scrollZoom": True,  # mouse-wheel zoom
+        "displaylogo": False,
+        "modeBarButtonsToRemove": [
+            "select2d",
+            "lasso2d",
+            "autoScale2d",
+            "resetScale2d",
+        ],
+    }
 
-    sel = getattr(event, "selection", None)
-    if sel is None and isinstance(event, dict):
-        sel = event.get("selection")
+    # IMPORTANT: on_select="rerun" lets Streamlit capture point selection
+    event = st.plotly_chart(fig, use_container_width=True, config=config, on_select="rerun", selection_mode=["points"])
 
     clicked_idx = None
-    if sel:
-        points = getattr(sel, "points", None)
-        if points is None and isinstance(sel, dict):
-            points = sel.get("points")
-        if points:
-            for p in points:
-                cd = p.get("customdata")
-                if cd is not None:
-                    clicked_idx = int(cd)
-                    break
+    try:
+        # Streamlit selection payload
+        pts = event.selection.points  # type: ignore[attr-defined]
+        if pts and isinstance(pts, list):
+            # plotly index is under "point_index"
+            clicked_idx = pts[0].get("point_index", None)
+    except Exception:
+        clicked_idx = None
 
-    if clicked_idx is not None:
-        if 0 <= clicked_idx < len(df) and st.session_state.get("last_click_idx") != clicked_idx:
-            st.session_state["last_click_idx"] = clicked_idx
-            clicked_genre = df.loc[clicked_idx, "genre"]
-            st.session_state["pending_genre"] = clicked_genre
-            push_history(clicked_genre)
+    if clicked_idx is not None and isinstance(clicked_idx, int):
+        if 0 <= clicked_idx < len(genres):
+            g = genres[clicked_idx]
+            st.session_state.selected_genre = g
+            st.session_state.active_path = []
+            push_history(g)
+            st.session_state.last_clicked_idx = clicked_idx
             st.rerun()
 
-# ---------------- Details column ----------------
-with col_details:
+    st.caption("Tip: drag to pan; mouse wheel zooms. Click a dot to load details.")
+
+
+# ----------------------------
+# Genre details (right)
+# ----------------------------
+with col_right:
     st.subheader("Genre details")
 
-    genre_name = st.session_state.get("selected_genre_dropdown", NONE_OPTION)
-    if genre_name == NONE_OPTION:
-        st.caption("Click a dot or choose a genre to see details.")
+    selected = st.session_state.selected_genre
+    if not selected:
+        st.write("Pick a genre from the dropdown or click a dot on the map.")
+        st.stop()
+
+    st.markdown(f"### {selected}")
+
+    wiki_title = resolve_wiki_title_for_genre(selected)
+    if not wiki_title:
+        st.info("No mapped Wikipedia page for this genre yet. (It may be in needs_review.)")
+        st.stop()
+
+    # Wikipedia intro
+    try:
+        info = wiki_intro_by_title(wiki_title)
+    except Exception as e:
+        st.warning(f"Could not load Wikipedia intro: {e}")
+        st.stop()
+
+    para = info.get("paragraph", "")
+    url = info.get("url", "")
+
+    if para:
+        st.write(para)
     else:
-        st.markdown(f"**{genre_name}**")
+        st.caption("No summary available.")
 
-        wiki = fetch_wikipedia_lead(genre_name)
-        if wiki.get("paragraph"):
-            st.write(wiki["paragraph"])
+    if url:
+        st.link_button("Open Wikipedia article", url)
+
+    st.markdown("---")
+
+    # Spotify example based on an artist mentioned in the first paragraph (best effort)
+    token = spotify_get_token()
+    market = st.session_state.market
+
+    example_track = None
+    example_title = ""
+    try:
+        example_track = pick_spotify_example_from_wikipedia(token, info.get("title", wiki_title), market=market)
+    except Exception:
+        example_track = None
+
+    if not token:
+        st.info("Spotify credentials not found. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET in Streamlit secrets.")
+        st.stop()
+
+    if example_track and example_track.get("id"):
+        track_id = example_track["id"]
+        track_name = example_track.get("name", "Example track")
+        artist_names = ", ".join([a.get("name", "") for a in example_track.get("artists", []) if a.get("name")])
+
+        picked_from = example_track.get("_picked_from_artist")
+        if picked_from:
+            example_title = f"Example (artist mentioned in intro): {picked_from}"
         else:
-            st.caption("No clear music-related Wikipedia summary found for this genre name.")
+            example_title = "Example"
 
-        if wiki.get("url"):
-            st.markdown(f"[Open Wikipedia article]({wiki['url']})")
+        st.markdown(f"**{example_title}:** {track_name} — {artist_names}")
 
-        st.divider()
+        st.components.v1.html(spotify_embed_html(track_id), height=170, scrolling=False)
 
-        client_id, client_secret = _get_spotify_creds()
-        if not client_id or not client_secret:
-            st.warning("Spotify keys not found in Streamlit Secrets.")
-        else:
-            artist = spotify_artist_from_wikipedia_links(wiki.get("lead_link_names", []), market=market)
-            if artist:
-                st.markdown(f"**Artist from Wikipedia lead:** {artist['name']}")
-                st.components.v1.html(spotify_embed_html("artist", artist["id"], height=352), height=370, scrolling=False)
-                if artist.get("url"):
-                    st.markdown(f"[Open in Spotify]({artist['url']})")
-            else:
-                st.caption("No clear artist found in the first paragraph links. (Some Wikipedia pages don’t name artists early.)")
-                st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
+        open_url = example_track.get("external_urls", {}).get("spotify", "")
+        if open_url:
+            st.link_button("Open in Spotify", open_url)
+    else:
+        st.caption("No Spotify example found for this genre right now.")
+
+
+# Footer note
+st.markdown(
+    "<div class='small-muted'>Data: EveryNoise-derived genre attributes (genre, x, y, r, g, b). Connections are nearest-neighbor links.</div>",
+    unsafe_allow_html=True,
+)
