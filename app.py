@@ -2,7 +2,7 @@ import base64
 import heapq
 import time
 import zlib
-from typing import Optional, List, Tuple, Dict
+from typing import Optional, List, Tuple, Dict, Set
 from urllib.parse import quote
 
 import numpy as np
@@ -153,8 +153,8 @@ def fetch_wikipedia_intro(genre_name: str) -> Dict[str, Optional[str]]:
 
     # 1) Search for best page
     queries = [
-        f'{genre_name} music genre',
-        f'{genre_name} (music)',
+        f"{genre_name} music genre",
+        f"{genre_name} (music)",
         genre_name,
     ]
 
@@ -339,7 +339,6 @@ def spotify_embed_html(item_type: str, item_id: str, height: int = 152) -> str:
 def push_history(genre: str, max_len: int = 20):
     hist = st.session_state.setdefault("genre_history", [])
     if genre and (len(hist) == 0 or hist[0] != genre):
-        # move to top, unique
         hist = [genre] + [g for g in hist if g != genre]
         st.session_state["genre_history"] = hist[:max_len]
 
@@ -357,7 +356,6 @@ def make_figure(
 ) -> go.Figure:
     n = len(df_plot)
 
-    # One single clickable points trace (so click pointIndex == df row index)
     size = np.full(n, 7.0)
     opacity = np.full(n, 0.80)
 
@@ -375,7 +373,6 @@ def make_figure(
 
     fig = go.Figure()
 
-    # Edges (optional)
     if show_edges and edges:
         xs, ys = [], []
         for u, v, _d in edges:
@@ -393,7 +390,6 @@ def make_figure(
             )
         )
 
-    # Path overlay (if present)
     if path and len(path) >= 2:
         px, py = [], []
         for a, b in zip(path[:-1], path[1:]):
@@ -411,7 +407,6 @@ def make_figure(
             )
         )
 
-    # Points (always visible)
     fig.add_trace(
         go.Scatter(
             x=df_plot["x"],
@@ -450,7 +445,6 @@ st.set_page_config(page_title="Phase 1: Genre Map", layout="wide")
 st.markdown(
     """
 <style>
-/* Pointer cursor for dropdowns */
 div[data-baseweb="select"] * { cursor: pointer !important; }
 div[data-baseweb="select"] input { caret-color: transparent; }
 </style>
@@ -460,20 +454,16 @@ div[data-baseweb="select"] input { caret-color: transparent; }
 
 st.title("Phase 1 Prototype — Genre Map")
 
-# ---- Apply pending click selection BEFORE widgets are created
 pending = st.session_state.pop("pending_genre", None)
 if pending:
     st.session_state["selected_genre_dropdown"] = pending
 
-# Sidebar
 with st.sidebar:
-    # Selection history at TOP
     st.header("Selection history")
     hist = st.session_state.get("genre_history", [])
     if not hist:
         st.caption("Click dots or pick genres to build history.")
     else:
-        # clickable history buttons
         for i, g in enumerate(hist[:12]):
             if st.button(g, key=f"hist_{i}", use_container_width=True):
                 st.session_state["selected_genre_dropdown"] = g
@@ -513,14 +503,11 @@ with st.sidebar:
     st.header("View")
     view_mode = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
 
-# Load data
 df = load_genre_data("upload" if source == "Upload CSV" else "web", uploaded_bytes)
 
-# Defaults
 if "selected_genre_dropdown" not in st.session_state:
     st.session_state["selected_genre_dropdown"] = df["genre"].iloc[0] if len(df) else ""
 
-# Prepare plot coords
 df_plot = df.copy()
 if view_mode == "Fit to screen":
     x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
@@ -533,10 +520,8 @@ if view_mode == "Fit to screen":
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
 adj, undirected_edges = build_knn_graph(coords, k=k)
 
-# Layout: controls | map | details
 col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
 
-# ---------------- Controls column ----------------
 with col_controls:
     st.subheader("Controls")
 
@@ -565,7 +550,6 @@ with col_controls:
     st.caption("Closest genres")
     st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
 
-    # Path finder
     path: List[int] = []
     if st.session_state.get("enable_path", True):
         st.markdown("### Path finder")
@@ -579,7 +563,6 @@ with col_controls:
 
         if end_candidates:
             end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
-
             st.markdown('<div style="height: 90px;"></div>', unsafe_allow_html=True)
 
             if st.button("Find shortest path"):
@@ -590,16 +573,12 @@ with col_controls:
                 else:
                     st.error("No path found. Try increasing connections.")
 
-# ---------------- Map column ----------------
 with col_map:
     st.subheader("Map (click a dot)")
 
-    # Show either: focused edges OR full edges (your call)
     show_edges = st.session_state.get("show_edges", True)
 
-    # Keep edges small: only show edges around selection unless path exists
     if path and len(path) >= 2:
-        # show only path edges when path exists (clean)
         edges_to_draw = []
     else:
         focus = {selected_idx} | neighbor_idxs
@@ -624,7 +603,6 @@ with col_map:
     )
 
     if clicked:
-        # Because we use ONE points trace, pointIndex maps to df row index
         pi = clicked[0].get("pointIndex")
         if pi is not None and 0 <= int(pi) < len(df):
             clicked_genre = df.loc[int(pi), "genre"]
@@ -632,7 +610,6 @@ with col_map:
             push_history(clicked_genre)
             st.rerun()
 
-# ---------------- Details column ----------------
 with col_details:
     st.subheader("Genre details")
     genre_name = st.session_state.get("selected_genre_dropdown", "")
@@ -643,7 +620,6 @@ with col_details:
 
     st.markdown(f"**{genre_name}**")
 
-    # Wikipedia
     wiki = fetch_wikipedia_intro(genre_name)
     if wiki.get("paragraph"):
         st.write(wiki["paragraph"])
@@ -655,7 +631,6 @@ with col_details:
 
     st.divider()
 
-    # Spotify Example (always visible, no dropdown)
     client_id, client_secret = _get_spotify_creds()
     if not client_id or not client_secret:
         st.warning("Spotify keys not found in Streamlit Secrets.")
@@ -683,7 +658,6 @@ with col_details:
 
     st.divider()
 
-    # Pinned player (persistent across selection changes)
     pinned_type = st.session_state.get("pinned_type")
     pinned_id = st.session_state.get("pinned_id")
     pinned_url = st.session_state.get("pinned_url")
