@@ -1,6 +1,7 @@
 import csv
 import re
 import time
+import argparse
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -13,9 +14,8 @@ WIKIDATA_API = "https://www.wikidata.org/w/api.php"
 WDQS = "https://query.wikidata.org/sparql"
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 
-MUSIC_GENRE_QID = "Q188451"  # "music genre" item in Wikidata
+MUSIC_GENRE_QID = "Q188451"  # music genre
 
-# Very conservative filter to reject place pages in Wikipedia fallback
 MUSIC_HINTS = ["music", "musical", "genre", "style", "band", "song", "album"]
 PLACE_HINTS = ["city", "town", "county", "province", "state", "capital", "population", "located in"]
 
@@ -42,16 +42,14 @@ def load_overrides(path: Path) -> Dict[str, str]:
     return out
 
 
-def http_get(url: str, params: dict, timeout: int = 60) -> dict:
-    """
-    GET with a polite User-Agent, and basic 429 handling.
-    """
+def http_get(session: requests.Session, url: str, params: dict, timeout: int = 60) -> dict:
     headers = {"User-Agent": UA}
     for attempt in range(6):
-        r = requests.get(url, params=params, headers=headers, timeout=timeout)
+        r = session.get(url, params=params, headers=headers, timeout=timeout)
         if r.status_code == 429:
             retry = r.headers.get("Retry-After")
             sleep_s = int(retry) if retry and retry.isdigit() else (2 + attempt * 2)
+            print(f"Rate limited (429). Sleeping {sleep_s}s...", flush=True)
             time.sleep(sleep_s)
             continue
         r.raise_for_status()
@@ -59,15 +57,10 @@ def http_get(url: str, params: dict, timeout: int = 60) -> dict:
     raise RuntimeError(f"Too many requests repeatedly for {url}")
 
 
-def wdqs_ask_is_music_genre(qid: str) -> bool:
-    """
-    Ask WDQS: is this item an instance/subclass (transitively) of music genre?
-    Tiny queries like this are much more reliable than one huge "download everything" query.
-    """
+def wdqs_ask_is_music_genre(session: requests.Session, qid: str) -> bool:
     query = f"""
     PREFIX wd: <http://www.wikidata.org/entity/>
     PREFIX wdt: <http://www.wikidata.org/prop/direct/>
-
     ASK {{
       {{
         wd:{qid} wdt:P31/wdt:P279* wd:{MUSIC_GENRE_QID} .
@@ -76,33 +69,27 @@ def wdqs_ask_is_music_genre(qid: str) -> bool:
       }}
     }}
     """
-    headers = {
-        "User-Agent": UA,
-        "Accept": "application/sparql-results+json",
-    }
-
+    headers = {"User-Agent": UA, "Accept": "application/sparql-results+json"}
     for attempt in range(6):
-        r = requests.get(WDQS, params={"query": query, "format": "json"}, headers=headers, timeout=60)
+        r = session.get(WDQS, params={"query": query, "format": "json"}, headers=headers, timeout=60)
         if r.status_code == 429:
             retry = r.headers.get("Retry-After")
             sleep_s = int(retry) if retry and retry.isdigit() else (2 + attempt * 2)
+            print(f"WDQS 429. Sleeping {sleep_s}s...", flush=True)
             time.sleep(sleep_s)
             continue
         r.raise_for_status()
-        js = r.json()
-        return bool(js.get("boolean", False))
+        return bool(r.json().get("boolean", False))
     return False
 
 
-def wikidata_search_candidates(genre: str, limit: int = 8) -> List[Tuple[str, str]]:
-    """
-    Returns [(qid, label), ...] from Wikidata's search.
-    """
+def wikidata_search_candidates(session: requests.Session, query_text: str, limit: int = 6) -> List[Tuple[str, str]]:
     js = http_get(
+        session,
         WIKIDATA_API,
         params={
             "action": "wbsearchentities",
-            "search": genre,
+            "search": query_text,
             "language": "en",
             "format": "json",
             "limit": limit,
@@ -118,41 +105,27 @@ def wikidata_search_candidates(genre: str, limit: int = 8) -> List[Tuple[str, st
     return out
 
 
-def wikidata_best_music_genre_qid(genre: str) -> Optional[Tuple[str, str]]:
-    """
-    Find the best Wikidata item for this genre that actually is a music genre.
-    Returns (qid, best_label) or None.
-    """
-    # Search terms that push results toward music-genre meanings
-    search_terms = [
-        genre,
-        f"{genre} music genre",
-        f"{genre} genre",
-        f"{genre} musical style",
-    ]
-
-    seen = set()
-    candidates: List[Tuple[str, str]] = []
-
-    for term in search_terms:
-        for qid, label in wikidata_search_candidates(term, limit=8):
-            if qid not in seen:
-                seen.add(qid)
-                candidates.append((qid, label))
-
-    # Validate with WDQS ASK (this avoids cities/people/etc.)
-    for qid, label in candidates:
-        try:
-            if wdqs_ask_is_music_genre(qid):
-                return qid, (label or qid)
-        except Exception:
-            continue
-
-    return None
-
-
-def wikipedia_intro(title: str) -> Optional[str]:
+def wikidata_enwiki_title_for_qid(session: requests.Session, qid: str) -> Optional[str]:
     js = http_get(
+        session,
+        WIKIDATA_API,
+        params={
+            "action": "wbgetentities",
+            "ids": qid,
+            "props": "sitelinks",
+            "sitefilter": "enwiki",
+            "format": "json",
+        },
+        timeout=30,
+    )
+    ent = js.get("entities", {}).get(qid, {})
+    sl = ent.get("sitelinks", {}).get("enwiki", {})
+    return sl.get("title")
+
+
+def wikipedia_intro(session: requests.Session, title: str) -> Optional[str]:
+    js = http_get(
+        session,
         WIKI_API,
         params={
             "action": "query",
@@ -184,20 +157,17 @@ def wikipedia_intro_looks_like_music(intro: Optional[str]) -> bool:
     return True
 
 
-def wikipedia_title_from_search(genre: str) -> Optional[str]:
-    """
-    Strict fallback: only accept pages whose intro looks music-related.
-    """
+def wikipedia_title_from_search(session: requests.Session, genre: str) -> Optional[str]:
     queries = [
         f'intitle:"{genre}" (music OR genre OR style)',
         f'"{genre}" (music OR genre OR style)',
         f"{genre} music genre",
         f"{genre} musical style",
     ]
-
     for q in queries:
         try:
             js = http_get(
+                session,
                 WIKI_API,
                 params={"action": "query", "list": "search", "srsearch": q, "srlimit": 6, "format": "json"},
                 timeout=30,
@@ -206,45 +176,29 @@ def wikipedia_title_from_search(genre: str) -> Optional[str]:
                 title = hit.get("title")
                 if not title:
                     continue
-                intro = wikipedia_intro(title)
+                intro = wikipedia_intro(session, title)
                 if wikipedia_intro_looks_like_music(intro):
                     return title
             time.sleep(0.2)
         except Exception:
             continue
-
     return None
 
 
-def wikidata_enwiki_title_for_qid(qid: str) -> Optional[str]:
-    """
-    Get the English Wikipedia sitelink title for a Wikidata item.
-    """
-    js = http_get(
-        WIKIDATA_API,
-        params={
-            "action": "wbgetentities",
-            "ids": qid,
-            "props": "sitelinks",
-            "sitefilter": "enwiki",
-            "format": "json",
-        },
-        timeout=30,
-    )
-    ent = js.get("entities", {}).get(qid, {})
-    sl = ent.get("sitelinks", {}).get("enwiki", {})
-    title = sl.get("title")
-    return title
-
-
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--limit", type=int, default=50, help="Process only first N genres (test). Use 0 for all.")
+    parser.add_argument("--sleep", type=float, default=0.05, help="Delay between genres.")
+    args = parser.parse_args()
+
+    print("Starting build_wiki_map.py ...", flush=True)
+
     repo_root = Path(__file__).resolve().parents[1]
     data_dir = repo_root / "data"
-    data_dir.mkdir(exist_ok=True)
-
     input_csv = data_dir / "genre_attrs.csv"
+
     if not input_csv.exists():
-        raise SystemExit("Missing data/genre_attrs.csv (you said you added it — double-check the path).")
+        raise SystemExit("Missing data/genre_attrs.csv. Make sure it's in the data/ folder.")
 
     overrides_path = data_dir / "wiki_overrides.csv"
     out_path = data_dir / "wiki_map.csv"
@@ -256,40 +210,71 @@ def main():
     if "genre" not in df.columns:
         raise SystemExit("Input CSV must contain a 'genre' column.")
 
+    if args.limit and args.limit > 0:
+        df = df.head(args.limit)
+
+    total = len(df)
+    print(f"Loaded {total} genres (limit={args.limit}).", flush=True)
+
+    session = requests.Session()
+
     rows_out = []
     rows_review = []
 
-    total = len(df)
     matched = 0
     matched_wikidata = 0
     matched_wiki_fallback = 0
+
+    qid_cache: Dict[str, bool] = {}
 
     for i, raw_genre in enumerate(df["genre"].astype(str).tolist(), start=1):
         g = raw_genre.strip()
         ng = norm(g)
 
-        if i % 200 == 0:
-            print(f"... {i}/{total} processed (matched {matched})")
+        if i == 1 or i % 10 == 0:
+            print(f"... {i}/{total} processing: {g}", flush=True)
 
-        # 1) manual override wins
+        # override wins
         if ng in overrides:
             rows_out.append({"genre": g, "wiki_title": overrides[ng], "confidence": "high", "source": "override"})
             matched += 1
             continue
 
-        # 2) Wikidata (validated)
-        best = wikidata_best_music_genre_qid(g)
-        if best:
-            qid, _label = best
-            title = wikidata_enwiki_title_for_qid(qid)
-            if title:
-                rows_out.append({"genre": g, "wiki_title": title, "confidence": "high", "source": "wikidata"})
-                matched += 1
-                matched_wikidata += 1
-                continue
+        # Wikidata: search candidates and validate "is music genre"
+        wiki_title = None
+        try:
+            candidates = wikidata_search_candidates(session, f"{g} music genre", limit=6)
+            candidates += wikidata_search_candidates(session, g, limit=6)
+        except Exception:
+            candidates = []
 
-        # 3) Wikipedia strict fallback
-        title = wikipedia_title_from_search(g)
+        seen = set()
+        for qid, _label in candidates:
+            if qid in seen:
+                continue
+            seen.add(qid)
+
+            if qid not in qid_cache:
+                try:
+                    qid_cache[qid] = wdqs_ask_is_music_genre(session, qid)
+                except Exception:
+                    qid_cache[qid] = False
+
+            if qid_cache[qid]:
+                t = wikidata_enwiki_title_for_qid(session, qid)
+                if t:
+                    wiki_title = t
+                    break
+
+        if wiki_title:
+            rows_out.append({"genre": g, "wiki_title": wiki_title, "confidence": "high", "source": "wikidata"})
+            matched += 1
+            matched_wikidata += 1
+            time.sleep(args.sleep)
+            continue
+
+        # Wikipedia strict fallback
+        title = wikipedia_title_from_search(session, g)
         if title:
             rows_out.append({"genre": g, "wiki_title": title, "confidence": "medium", "source": "wikipedia_fallback"})
             matched += 1
@@ -298,17 +283,18 @@ def main():
             rows_out.append({"genre": g, "wiki_title": "", "confidence": "none", "source": "unmatched"})
             rows_review.append({"genre": g})
 
-        time.sleep(0.05)  # small politeness delay
+        time.sleep(args.sleep)
 
     pd.DataFrame(rows_out).to_csv(out_path, index=False)
     pd.DataFrame(rows_review).to_csv(needs_review_path, index=False)
 
-    print("Done.")
-    print(f"Matched: {matched}/{total}")
-    print(f"  via Wikidata: {matched_wikidata}")
-    print(f"  via Wikipedia fallback: {matched_wiki_fallback}")
-    print(f"Wrote: {out_path}")
-    print(f"Needs review: {needs_review_path} (unmatched genres)")
+    print("Done.", flush=True)
+    print(f"Matched: {matched}/{total}", flush=True)
+    print(f"  via Wikidata: {matched_wikidata}", flush=True)
+    print(f"  via Wikipedia fallback: {matched_wiki_fallback}", flush=True)
+    print(f"Wrote: {out_path}", flush=True)
+    print(f"Needs review: {needs_review_path}", flush=True)
+
 
 if __name__ == "__main__":
     main()
