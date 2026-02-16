@@ -75,7 +75,6 @@ def stable_sample_genres(genres: pd.Series, n: int = 300) -> List[str]:
     Returns a "random-looking" but stable sample.
     (So it does NOT change every Streamlit rerun.)
     """
-    # Stable hash per genre string
     hashes = genres.astype(str).apply(lambda s: zlib.crc32(s.encode("utf-8")))
     picked_idx = hashes.nsmallest(min(n, len(genres))).index
     return genres.loc[picked_idx].sort_values().tolist()
@@ -100,7 +99,7 @@ def build_knn_graph(coords: np.ndarray, k: int):
     edges: List[Tuple[int, int, float]] = []
 
     for u in range(n):
-        for pos in range(1, k + 1):  # skip self
+        for pos in range(1, k + 1):  # skip self at pos 0
             v = int(indices[u, pos])
             d = float(distances[u, pos])
 
@@ -224,6 +223,22 @@ def make_figure(
 
 # ---------------- App UI ----------------
 st.set_page_config(page_title="Phase 1: Genre Map Prototype", layout="wide")
+
+# Cursor + dropdown feel:
+# - Force pointer cursor for Streamlit selectboxes (instead of I-beam)
+# Note: This affects the whole select control (including the text area).
+st.markdown(
+    """
+<style>
+/* Make selectboxes feel clickable */
+div[data-baseweb="select"] * { cursor: pointer !important; }
+/* Slightly clearer hover */
+div[data-baseweb="select"]:hover { filter: brightness(1.05); }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 st.title("Phase 1 Prototype — Genre Map")
 
 with st.sidebar:
@@ -268,37 +283,31 @@ adj, undirected_edges = build_knn_graph(coords, k=k)
 left, right = st.columns([1, 2], gap="large")
 
 with left:
-    st.subheader("Pick a genre")
+    st.subheader("Controls")
 
-    query = st.text_input("Search genres", value="", key="start_query")
+    # Putting dropdowns near the top makes them far more likely to open downward
+    # because there is usually room below them in the viewport.
+    query = st.text_input("Search start genre", value="", key="start_query")
 
     if query.strip():
         mask = df["genre"].str.contains(query.strip(), case=False, na=False)
         candidates = df.loc[mask, "genre"].tolist()
     else:
-        candidates = df["genre"].head(200).tolist()
+        candidates = df["genre"].head(400).tolist()
 
     if not candidates:
-        st.warning("No matches. Try a different search.")
+        st.warning("No start genre matches. Try a different search.")
         st.stop()
 
-    selected_genre = st.selectbox("Genre", candidates, index=0, key="start_genre")
+    selected_genre = st.selectbox("Start genre", candidates, index=0, key="start_genre")
     selected_idx = int(df.index[df["genre"] == selected_genre][0])
 
-    neighbor_idxs = {v for v, _d in adj[selected_idx]}
-    neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
-
-    st.caption("Selected genre")
-    st.markdown(f"**{selected_genre}**")
-
-    st.caption("Closest genres")
-    st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
-
+    # Path finder controls moved up (before the long neighbor list)
     path: List[int] = []
     path_edges: List[Tuple[int, int, float]] = []
 
     if show_pathfinder:
-        st.subheader("Path finder")
+        st.markdown("### Path finder")
 
         dest_query = st.text_input("Search destination genre", value="", key="dest_query")
 
@@ -306,18 +315,19 @@ with left:
             dest_mask = df["genre"].str.contains(dest_query.strip(), case=False, na=False)
             end_candidates = df.loc[dest_mask, "genre"].tolist()
         else:
-            # IMPORTANT: stable sample (does not change on reruns)
-            end_candidates = stable_sample_genres(df["genre"], n=300)
+            end_candidates = stable_sample_genres(df["genre"], n=500)
 
         if not end_candidates:
             st.warning("No destination matches.")
         else:
-            # Ensure the current selection is kept even if the list changes
             current_dest = st.session_state.get("dest_genre")
             if current_dest and current_dest not in end_candidates and current_dest in df["genre"].values:
                 end_candidates = [current_dest] + end_candidates
 
-            end = st.selectbox("Find a route to:", end_candidates, index=0, key="dest_genre")
+            end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
+
+            # Spacer under destination dropdown to discourage “flip up”
+            st.markdown('<div style="height: 120px;"></div>', unsafe_allow_html=True)
 
             if st.button("Find shortest path", key="find_path_btn"):
                 end_idx = int(df.index[df["genre"] == end][0])
@@ -330,6 +340,16 @@ with left:
                         path_edges = [(a, b, 0.0) for a, b in zip(path[:-1], path[1:])]
                 else:
                     st.error("No path found. Try increasing 'Connections per genre'.")
+
+    # Neighbors list (after controls)
+    neighbor_idxs = {v for v, _d in adj[selected_idx]}
+    neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
+
+    st.caption("Selected genre")
+    st.markdown(f"**{selected_genre}**")
+
+    st.caption("Closest genres")
+    st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
 
 with right:
     st.subheader("Map")
