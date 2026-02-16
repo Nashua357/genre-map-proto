@@ -1,4 +1,5 @@
 import heapq
+import zlib
 from typing import Optional, List, Tuple, Set
 
 import numpy as np
@@ -8,7 +9,7 @@ import streamlit as st
 from sklearn.neighbors import NearestNeighbors
 
 # EveryNoise-derived genre attributes mirrored in a public repo.
-# NOTE: This file currently uses columns: genre, x, y, hex_colour
+# This file currently uses columns: genre, x, y, hex_colour
 DATA_URL = "https://raw.githubusercontent.com/AyrtonB/EveryNoise-Watch/main/data/genre_attrs.csv"
 
 
@@ -28,7 +29,6 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
             raise ValueError("No uploaded file provided.")
         df = pd.read_csv(uploaded_bytes)
 
-    # Must-have columns
     required_base = {"genre", "x", "y"}
     missing_base = required_base - set(df.columns)
     if missing_base:
@@ -37,7 +37,6 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
     df = df.dropna(subset=["genre", "x", "y"]).copy()
     df["genre"] = df["genre"].astype(str)
 
-    # Ensure x/y are numeric
     df["x"] = pd.to_numeric(df["x"], errors="coerce")
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["x", "y"]).copy()
@@ -51,29 +50,35 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
         df["g"] = df["g"].clip(0, 255).astype(int)
         df["b"] = df["b"].clip(0, 255).astype(int)
     else:
-        # Try common hex color column names
         hex_col = None
         for c in ["hex_colour", "hex_color", "hex", "color", "colour"]:
             if c in df.columns:
                 hex_col = c
                 break
-
         if hex_col is None:
             raise ValueError(
                 f"Missing color columns. Need r/g/b or a hex column like hex_colour. Found: {list(df.columns)}"
             )
 
         h = df[hex_col].astype(str).str.strip().str.lstrip("#")
-        # Keep only valid 6-char hex; fallback to black for invalid values
         h = h.where(h.str.len() == 6, other="000000")
-
         df["r"] = h.str[0:2].apply(lambda s: int(s, 16))
         df["g"] = h.str[2:4].apply(lambda s: int(s, 16))
         df["b"] = h.str[4:6].apply(lambda s: int(s, 16))
 
-    # Keep a stable row order for indexing
-    df = df.reset_index(drop=True)
-    return df
+    return df.reset_index(drop=True)
+
+
+@st.cache_data(show_spinner=False)
+def stable_sample_genres(genres: pd.Series, n: int = 300) -> List[str]:
+    """
+    Returns a "random-looking" but stable sample.
+    (So it does NOT change every Streamlit rerun.)
+    """
+    # Stable hash per genre string
+    hashes = genres.astype(str).apply(lambda s: zlib.crc32(s.encode("utf-8")))
+    picked_idx = hashes.nsmallest(min(n, len(genres))).index
+    return genres.loc[picked_idx].sort_values().tolist()
 
 
 @st.cache_data(show_spinner=False)
@@ -95,7 +100,7 @@ def build_knn_graph(coords: np.ndarray, k: int):
     edges: List[Tuple[int, int, float]] = []
 
     for u in range(n):
-        for pos in range(1, k + 1):  # skip self at pos 0
+        for pos in range(1, k + 1):  # skip self
             v = int(indices[u, pos])
             d = float(distances[u, pos])
 
@@ -110,7 +115,8 @@ def build_knn_graph(coords: np.ndarray, k: int):
 
 def dijkstra_path(adj: List[List[Tuple[int, float]]], start: int, goal: int) -> List[int]:
     """
-    Shortest path by sum of distances. Returns node indices inclusive.
+    Shortest path by sum of distances.
+    Returns node indices inclusive.
     """
     if start == goal:
         return [start]
@@ -157,21 +163,17 @@ def make_figure(
     colors = rgb_strings(df_plot)
     n = len(df_plot)
 
-    # Default styling
     size = np.full(n, 5.0)
     opacity = np.full(n, 0.22)
 
-    # Highlight neighbors
     for i in neighbor_idxs:
         size[i] = 9.0
         opacity[i] = 0.9
 
-    # Highlight selected
     if selected_idx is not None:
         size[selected_idx] = 14.0
         opacity[selected_idx] = 1.0
 
-    # Highlight path
     path_set = set(path or [])
     for i in path_set:
         size[i] = max(size[i], 11.0)
@@ -179,7 +181,6 @@ def make_figure(
 
     fig = go.Figure()
 
-    # Lines
     if edges_to_draw:
         xs, ys = [], []
         for u, v, _d in edges_to_draw:
@@ -198,7 +199,6 @@ def make_figure(
             )
         )
 
-    # Points
     fig.add_trace(
         go.Scattergl(
             x=df_plot["x"],
@@ -252,13 +252,11 @@ with st.sidebar:
     st.header("View")
     view_mode = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
 
-# Use df_plot for all geometry so we can rescale without breaking indexing
+# Rescale for display if requested (keeps indexes stable)
 df_plot = df.copy()
-
 if view_mode == "Fit to screen":
     x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
     y_min, y_max = df_plot["y"].min(), df_plot["y"].max()
-
     if x_max != x_min:
         df_plot["x"] = (df_plot["x"] - x_min) / (x_max - x_min)
     if y_max != y_min:
@@ -267,13 +265,12 @@ if view_mode == "Fit to screen":
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
 adj, undirected_edges = build_knn_graph(coords, k=k)
 
-# ---- Main layout
 left, right = st.columns([1, 2], gap="large")
 
 with left:
     st.subheader("Pick a genre")
 
-    query = st.text_input("Search genres", value="")
+    query = st.text_input("Search genres", value="", key="start_query")
 
     if query.strip():
         mask = df["genre"].str.contains(query.strip(), case=False, na=False)
@@ -285,7 +282,7 @@ with left:
         st.warning("No matches. Try a different search.")
         st.stop()
 
-    selected_genre = st.selectbox("Genre", candidates, index=0)
+    selected_genre = st.selectbox("Genre", candidates, index=0, key="start_genre")
     selected_idx = int(df.index[df["genre"] == selected_genre][0])
 
     neighbor_idxs = {v for v, _d in adj[selected_idx]}
@@ -303,20 +300,26 @@ with left:
     if show_pathfinder:
         st.subheader("Path finder")
 
-        # A filtered list helps find targets quickly
-        end_query = st.text_input("Search destination genre", value="")
-        if end_query.strip():
-            end_mask = df["genre"].str.contains(end_query.strip(), case=False, na=False)
-            end_candidates = df.loc[end_mask, "genre"].tolist()
+        dest_query = st.text_input("Search destination genre", value="", key="dest_query")
+
+        if dest_query.strip():
+            dest_mask = df["genre"].str.contains(dest_query.strip(), case=False, na=False)
+            end_candidates = df.loc[dest_mask, "genre"].tolist()
         else:
-            end_candidates = df["genre"].sample(min(250, len(df))).sort_values().tolist()
+            # IMPORTANT: stable sample (does not change on reruns)
+            end_candidates = stable_sample_genres(df["genre"], n=300)
 
         if not end_candidates:
             st.warning("No destination matches.")
         else:
-            end = st.selectbox("Find a route to:", end_candidates, index=0)
+            # Ensure the current selection is kept even if the list changes
+            current_dest = st.session_state.get("dest_genre")
+            if current_dest and current_dest not in end_candidates and current_dest in df["genre"].values:
+                end_candidates = [current_dest] + end_candidates
 
-            if st.button("Find shortest path"):
+            end = st.selectbox("Find a route to:", end_candidates, index=0, key="dest_genre")
+
+            if st.button("Find shortest path", key="find_path_btn"):
                 end_idx = int(df.index[df["genre"] == end][0])
                 path = dijkstra_path(adj, selected_idx, end_idx)
 
@@ -331,7 +334,6 @@ with left:
 with right:
     st.subheader("Map")
 
-    # Draw only a focused set of edges to keep it fast:
     if path_edges:
         edges_to_draw = path_edges
     else:
