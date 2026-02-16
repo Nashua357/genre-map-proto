@@ -14,7 +14,7 @@ from sklearn.neighbors import NearestNeighbors
 from streamlit_plotly_events import plotly_events
 
 # =========================
-# Settings / URLs
+# URLs
 # =========================
 DATA_URL = "https://raw.githubusercontent.com/AyrtonB/EveryNoise-Watch/main/data/genre_attrs.csv"
 
@@ -50,7 +50,7 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["x", "y"]).copy()
 
-    # Color: support either r/g/b or a hex color column like hex_colour
+    # Color
     if {"r", "g", "b"}.issubset(df.columns):
         for c in ["r", "g", "b"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -141,7 +141,7 @@ def dijkstra_path(adj: List[List[Tuple[int, float]]], start: int, goal: int) -> 
 
 
 # =========================
-# Wikipedia (first paragraph)
+# Wikipedia
 # =========================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_wikipedia_first_paragraph(genre_name: str) -> Dict[str, Optional[str]]:
@@ -149,13 +149,7 @@ def fetch_wikipedia_first_paragraph(genre_name: str) -> Dict[str, Optional[str]]
     try:
         r = requests.get(
             WIKI_OPENSEARCH,
-            params={
-                "action": "opensearch",
-                "search": search_term,
-                "limit": 1,
-                "namespace": 0,
-                "format": "json",
-            },
+            params={"action": "opensearch", "search": search_term, "limit": 1, "namespace": 0, "format": "json"},
             headers={"User-Agent": WIKI_UA},
             timeout=15,
         )
@@ -185,7 +179,7 @@ def fetch_wikipedia_first_paragraph(genre_name: str) -> Dict[str, Optional[str]]
 
 
 # =========================
-# Spotify API (Client Credentials)
+# Spotify API
 # =========================
 def _get_spotify_creds() -> Tuple[Optional[str], Optional[str]]:
     try:
@@ -227,10 +221,6 @@ def get_spotify_token() -> Optional[str]:
 
 
 def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[Dict[str, str]]:
-    """
-    Returns one example to play for a genre.
-    We keep a lightweight session cache to avoid repeated searches.
-    """
     cache = st.session_state.setdefault("spotify_example_cache", {})
     key = (genre_name, market)
     if key in cache:
@@ -242,7 +232,7 @@ def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[D
 
     headers = {"Authorization": f"Bearer {tok}"}
 
-    # 1) Try track search with genre:"..."
+    # Track search (best)
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
@@ -266,7 +256,7 @@ def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[D
     except Exception:
         pass
 
-    # 2) Fallback: playlist search
+    # Playlist fallback
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
@@ -307,7 +297,7 @@ def spotify_embed_html(item_type: str, item_id: str) -> str:
 
 
 # =========================
-# Plotly figure
+# Plotly figure (dark + visible dots)
 # =========================
 def make_figure(
     df_plot: pd.DataFrame,
@@ -316,24 +306,10 @@ def make_figure(
     edges_to_draw: List[Tuple[int, int, float]],
     path: Optional[List[int]],
 ) -> go.Figure:
-    n = len(df_plot)
-    size = np.full(n, 5.0)
-    opacity = np.full(n, 0.22)
-
-    for i in neighbor_idxs:
-        size[i] = 9.0
-        opacity[i] = 0.9
-
-    size[selected_idx] = 14.0
-    opacity[selected_idx] = 1.0
-
-    path_set = set(path or [])
-    for i in path_set:
-        size[i] = max(size[i], 11.0)
-        opacity[i] = 1.0
-
     fig = go.Figure()
+    n = len(df_plot)
 
+    # Edges first (so points sit on top)
     if edges_to_draw:
         xs, ys = [], []
         for u, v, _d in edges_to_draw:
@@ -341,28 +317,65 @@ def make_figure(
             ys.extend([df_plot.at[u, "y"], df_plot.at[v, "y"], None])
         fig.add_trace(
             go.Scattergl(
-                x=xs, y=ys, mode="lines",
-                line=dict(width=1), opacity=0.30,
-                hoverinfo="skip", showlegend=False
+                x=xs,
+                y=ys,
+                mode="lines",
+                line=dict(width=1),
+                opacity=0.35,
+                hoverinfo="skip",
+                showlegend=False,
             )
         )
 
+    # Base dots (visible!)
     fig.add_trace(
         go.Scattergl(
             x=df_plot["x"],
             y=df_plot["y"],
             mode="markers",
-            marker=dict(size=size, color=df_plot["hex_colour"], opacity=opacity),
+            marker=dict(size=5, color=df_plot["hex_colour"], opacity=0.55),
             text=df_plot["genre"],
-            customdata=np.arange(n),
             hovertemplate="<b>%{text}</b><extra></extra>",
             showlegend=False,
         )
     )
 
+    # Highlight neighbors + selected
+    hi_idx = sorted(list(neighbor_idxs | {selected_idx}))
+    hi = df_plot.iloc[hi_idx]
+    fig.add_trace(
+        go.Scattergl(
+            x=hi["x"],
+            y=hi["y"],
+            mode="markers",
+            marker=dict(size=11, color=hi["hex_colour"], opacity=1.0, line=dict(width=1)),
+            text=hi["genre"],
+            hovertemplate="<b>%{text}</b><extra></extra>",
+            showlegend=False,
+        )
+    )
+
+    # Emphasize selected on top
+    sel = df_plot.iloc[[selected_idx]]
+    fig.add_trace(
+        go.Scattergl(
+            x=sel["x"],
+            y=sel["y"],
+            mode="markers",
+            marker=dict(size=16, color=sel["hex_colour"], opacity=1.0, line=dict(width=2)),
+            text=sel["genre"],
+            hovertemplate="<b>%{text}</b><extra></extra>",
+            showlegend=False,
+        )
+    )
+
+    # Dark styling to match Streamlit
     fig.update_layout(
+        template="plotly_dark",
         height=720,
         margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
         dragmode="pan",
@@ -371,7 +384,7 @@ def make_figure(
 
 
 # =========================
-# App UI
+# UI
 # =========================
 st.set_page_config(page_title="Phase 1: Genre Map", layout="wide")
 
@@ -418,7 +431,7 @@ with st.sidebar:
     player_url = st.session_state.get("player_url")
 
     if player_type and player_id:
-        # IMPORTANT: no key= here (fixes your TypeError)
+        # IMPORTANT: no key= here (your Streamlit build errors on key=)
         st.components.v1.html(spotify_embed_html(player_type, player_id), height=170, scrolling=False)
         if player_url:
             st.markdown(f"[Open in Spotify]({player_url})")
@@ -428,14 +441,22 @@ with st.sidebar:
             st.session_state.pop("player_url", None)
             st.rerun()
     else:
-        st.caption("Pick a genre → Details panel → 'Load into player'.")
+        st.caption("Load something from the Genre details panel.")
 
 
-# Keep a selected genre in memory
-if "selected_genre" not in st.session_state:
-    st.session_state["selected_genre"] = df["genre"].iloc[0] if len(df) else ""
+# ---- Apply pending click selection BEFORE widgets are created
+pending = st.session_state.pop("pending_genre", None)
+if pending:
+    st.session_state["selected_genre_dropdown"] = pending
+    st.session_state["active_genre"] = pending
 
-# Prepare plot coordinates
+# Defaults
+if "selected_genre_dropdown" not in st.session_state:
+    st.session_state["selected_genre_dropdown"] = df["genre"].iloc[0] if len(df) else ""
+if "active_genre" not in st.session_state:
+    st.session_state["active_genre"] = st.session_state["selected_genre_dropdown"]
+
+# Plot coords
 df_plot = df.copy()
 if view_mode == "Fit to screen":
     x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
@@ -448,11 +469,9 @@ if view_mode == "Fit to screen":
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
 adj, undirected_edges = build_knn_graph(coords, k=k)
 
-# Layout: controls | map | details
+# Layout
 col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.2], gap="large")
 
-
-# ---------------- Controls column ----------------
 with col_controls:
     st.subheader("Controls")
 
@@ -467,20 +486,20 @@ with col_controls:
         st.warning("No matches.")
         st.stop()
 
-    cur = st.session_state["selected_genre"]
+    cur = st.session_state["selected_genre_dropdown"]
     if cur and cur not in candidates and cur in df["genre"].values:
         candidates = [cur] + candidates
 
-    chosen = st.selectbox("Selected genre", candidates, index=0, key="selected_genre")
+    chosen = st.selectbox("Selected genre", candidates, index=0, key="selected_genre_dropdown")
+    st.session_state["active_genre"] = chosen
+
     selected_idx = int(df.index[df["genre"] == chosen][0])
-
     neighbor_idxs = {v for v, _d in adj[selected_idx]}
-    neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
 
+    neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
     st.caption("Closest genres")
     st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
 
-    # Path finder
     path: List[int] = []
     path_edges: List[Tuple[int, int, float]] = []
 
@@ -513,8 +532,6 @@ with col_controls:
                 else:
                     st.error("No path found. Try increasing connections.")
 
-
-# ---------------- Map column ----------------
 with col_map:
     st.subheader("Map (click a dot)")
 
@@ -532,27 +549,26 @@ with col_map:
         path=path if path else None,
     )
 
-    # IMPORTANT: plotly_events captures real click events reliably
     clicked = plotly_events(
         fig,
         click_event=True,
         select_event=False,
         hover_event=False,
+        override_height=720,
         key="plotly_click",
     )
 
     if clicked:
-        # clicked[0] includes pointIndex
         pi = clicked[0].get("pointIndex")
         if pi is not None and 0 <= int(pi) < len(df):
-            st.session_state["selected_genre"] = df.loc[int(pi), "genre"]
+            clicked_genre = df.loc[int(pi), "genre"]
+            st.session_state["pending_genre"] = clicked_genre
+            st.rerun()
 
-
-# ---------------- Details column ----------------
 with col_details:
     st.subheader("Genre details")
-    genre_name = st.session_state.get("selected_genre", "")
 
+    genre_name = st.session_state.get("active_genre", "")
     if not genre_name:
         st.info("Select a genre to see details.")
     else:
@@ -572,6 +588,7 @@ with col_details:
         client_id, client_secret = _get_spotify_creds()
         if not client_id or not client_secret:
             st.warning("Spotify keys not found in Streamlit Secrets.")
+            st.caption("Manage app → Settings → Secrets")
         else:
             ex = spotify_example_for_genre(genre_name, market=market)
             if ex:
@@ -590,11 +607,9 @@ with col_details:
                         st.markdown(f"[Open in Spotify]({ex['url']})")
 
                 with st.expander("Preview here"):
-                    # IMPORTANT: no key= here either
                     st.components.v1.html(spotify_embed_html(ex["type"], ex["id"]), height=170, scrolling=False)
             else:
                 st.caption("Couldn’t find a Spotify example for this exact genre name.")
                 st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
 
-
-st.caption("Once loaded, the Now Playing embed stays in the sidebar. You can pause/play anytime.")
+st.caption("The map is now styled for dark mode and dots are visible again. Click a dot to update details.")
