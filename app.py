@@ -765,3 +765,307 @@ def make_figure(
                 showlegend=False,
                 uid="points_highlight",
             )
+        )
+
+    # 5) labels (always present; sometimes empty)
+    fig.add_trace(
+        go.Scatter(
+            x=label_x,
+            y=label_y,
+            mode="text",
+            text=label_t,
+            textposition="top center",
+            textfont=dict(size=12, color="rgba(255,255,255,0.92)"),
+            hoverinfo="skip",
+            showlegend=False,
+            uid="labels",
+        )
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=720,
+        margin=dict(l=10, r=10, t=10, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        xaxis=dict(visible=False),
+        yaxis=dict(visible=False),
+        dragmode="pan",
+        clickmode="event+select",
+        hovermode=False,
+        uirevision="keep-view",
+    )
+    return fig
+
+
+# =========================
+# App UI
+# =========================
+st.set_page_config(page_title="Phase 1: Genre Map", layout="wide")
+
+st.markdown(
+    """
+<style>
+div[data-baseweb="select"] * { cursor: pointer !important; }
+div[data-baseweb="select"] input { caret-color: transparent; }
+/* Make the plot clearly clickable */
+.js-plotly-plot, .js-plotly-plot * { cursor: pointer !important; }
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
+st.title("Phase 1 Prototype — Genre Map")
+
+# Defaults
+if "selected_genre_dropdown" not in st.session_state:
+    st.session_state["selected_genre_dropdown"] = NONE_OPTION
+if "current_path" not in st.session_state:
+    st.session_state["current_path"] = []
+if "path_message" not in st.session_state:
+    st.session_state["path_message"] = ""
+
+# Apply pending click selection BEFORE widgets are created
+pending = st.session_state.pop("pending_genre", None)
+if pending:
+    st.session_state["selected_genre_dropdown"] = pending
+    st.session_state["current_path"] = []
+    st.session_state["path_message"] = ""
+
+# Sidebar
+with st.sidebar:
+    st.header("Selection history")
+    hist = st.session_state.get("genre_history", [])
+    if not hist:
+        st.caption("Click dots or pick genres to build history.")
+    else:
+        for i, g in enumerate(hist[:12]):
+            if st.button(g, key=f"hist_{i}", use_container_width=True):
+                st.session_state["selected_genre_dropdown"] = g
+                st.session_state["current_path"] = []
+                st.session_state["path_message"] = ""
+                st.rerun()
+        cols = st.columns(2)
+        with cols[0]:
+            if st.button("Clear", use_container_width=True):
+                st.session_state["genre_history"] = []
+                st.session_state["selected_genre_dropdown"] = NONE_OPTION
+                st.session_state["current_path"] = []
+                st.session_state["path_message"] = ""
+                st.rerun()
+        with cols[1]:
+            st.caption(f"{len(hist)} saved")
+
+    st.divider()
+
+    st.header("Data")
+    source = st.radio("Load dataset from:", ["Web (recommended)", "Upload CSV"], index=0)
+    uploaded_bytes = None
+    if source == "Upload CSV":
+        uploaded = st.file_uploader("Upload genre CSV", type=["csv"])
+        if not uploaded:
+            st.stop()
+        uploaded_bytes = uploaded.getvalue()
+
+    st.divider()
+    st.header("Connections")
+    k = st.slider("Connections per genre", 2, 20, 8)
+    st.checkbox("Show connection lines", value=True, key="show_edges")
+    st.checkbox("Enable path finder", value=True, key="enable_path")
+
+    st.divider()
+    st.header("Labels")
+    show_labels = st.checkbox("Show map labels", value=True)
+    neighbor_label_count = st.slider("Neighbor labels (when selected)", 0, 20, 6)
+
+    st.divider()
+    st.header("Spotify examples")
+    market = st.selectbox("Country/market", ["AU", "US", "GB", "CA", "NZ", "DE", "FR"], index=0)
+
+    st.divider()
+    st.header("View")
+    view_mode = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
+
+# Load data
+df = load_genre_data("upload" if source == "Upload CSV" else "web", uploaded_bytes)
+
+# Prepare plot coords
+df_plot = df.copy()
+if view_mode == "Fit to screen":
+    x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
+    y_min, y_max = df_plot["y"].min(), df_plot["y"].max()
+    if x_max != x_min:
+        df_plot["x"] = (df_plot["x"] - x_min) / (x_max - x_min)
+    if y_max != y_min:
+        df_plot["y"] = (df_plot["y"] - y_min) / (y_max - y_min)
+
+# Precompute crisp “faint” colors (no opacity blur)
+# - selection mode: keep some color
+# - path mode: even fainter
+df_plot["hex_faint_sel"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.28))
+df_plot["hex_faint_path"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.18))
+
+coords = df_plot[["x", "y"]].to_numpy(dtype=float)
+adj, undirected_edges = build_knn_graph(coords, k=k)
+
+col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
+
+# ---------------- Controls column ----------------
+with col_controls:
+    st.subheader("Controls")
+
+    q = st.text_input("Search genre", value="", key="start_query")
+    if q.strip():
+        mask = df["genre"].str.contains(q.strip(), case=False, na=False)
+        candidates = df.loc[mask, "genre"].tolist()
+    else:
+        candidates = df["genre"].head(800).tolist()
+
+    cur = st.session_state.get("selected_genre_dropdown", NONE_OPTION)
+    options = [NONE_OPTION] + candidates
+    if cur != NONE_OPTION and cur not in options and cur in df["genre"].values:
+        options = [NONE_OPTION, cur] + candidates
+
+    chosen = st.selectbox("Selected genre", options, key="selected_genre_dropdown")
+
+    # Clear path whenever selection changes
+    if st.session_state.get("prev_dropdown") != chosen:
+        st.session_state["prev_dropdown"] = chosen
+        st.session_state["current_path"] = []
+        st.session_state["path_message"] = ""
+
+    if chosen != NONE_OPTION:
+        push_history(chosen)
+        selected_idx = int(df.index[df["genre"] == chosen][0])
+        neighbor_idxs = {v for v, _d in adj[selected_idx]}
+
+        neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
+        st.caption("Closest genres")
+        st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
+    else:
+        selected_idx = None
+        neighbor_idxs = set()
+        st.caption("Closest genres")
+        st.write("Select a genre to show its nearest neighbors.")
+
+    if st.session_state.get("enable_path", True):
+        st.markdown("### Path finder")
+        if chosen == NONE_OPTION:
+            st.info("Pick a start genre first, then you can find a path.")
+        else:
+            dest_q = st.text_input("Search destination", value="", key="dest_query")
+            if dest_q.strip():
+                dest_mask = df["genre"].str.contains(dest_q.strip(), case=False, na=False)
+                end_candidates = df.loc[dest_mask, "genre"].tolist()
+            else:
+                end_candidates = stable_sample_genres(df["genre"], n=500)
+
+            if end_candidates:
+                end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
+                if st.button("Find shortest path"):
+                    end_idx = int(df.index[df["genre"] == end][0])
+                    path = dijkstra_path(adj, selected_idx, end_idx)
+                    st.session_state["current_path"] = path
+                    st.session_state["path_message"] = (
+                        f"Path found: {len(path)} steps." if path else "No path found. Try increasing connections."
+                    )
+                    st.rerun()
+
+    if st.session_state.get("path_message"):
+        if st.session_state["current_path"]:
+            st.success(st.session_state["path_message"])
+        else:
+            st.error(st.session_state["path_message"])
+
+# ---------------- Map column ----------------
+with col_map:
+    st.subheader("Map (click a dot)")
+
+    fig = make_figure(
+        df_plot=df_plot,
+        selected_idx=selected_idx,
+        neighbor_idxs=neighbor_idxs,
+        edges_all=undirected_edges,
+        adj=adj,
+        show_edges=st.session_state.get("show_edges", True),
+        path=st.session_state.get("current_path", []),
+        show_labels=show_labels,
+        neighbor_label_count=neighbor_label_count,
+    )
+
+    event = st.plotly_chart(
+        fig,
+        key="genre_map",
+        on_select="rerun",
+        selection_mode="points",
+        config={"scrollZoom": True, "doubleClick": "reset", "displaylogo": False, "responsive": True},
+    )
+
+    # Pick a clicked point that has customdata (ignore line traces etc.)
+    sel = getattr(event, "selection", None)
+    if sel is None and isinstance(event, dict):
+        sel = event.get("selection")
+
+    clicked_idx = None
+    if sel:
+        points = getattr(sel, "points", None)
+        if points is None and isinstance(sel, dict):
+            points = sel.get("points")
+
+        if points:
+            for p in points:
+                cd = p.get("customdata")
+                if cd is not None:
+                    clicked_idx = int(cd)
+                    break
+
+    if clicked_idx is not None:
+        if 0 <= clicked_idx < len(df) and st.session_state.get("last_click_idx") != clicked_idx:
+            st.session_state["last_click_idx"] = clicked_idx
+            clicked_genre = df.loc[clicked_idx, "genre"]
+            st.session_state["pending_genre"] = clicked_genre
+            push_history(clicked_genre)
+            st.rerun()
+
+# ---------------- Details column ----------------
+with col_details:
+    st.subheader("Genre details")
+
+    genre_name = st.session_state.get("selected_genre_dropdown", NONE_OPTION)
+    if genre_name == NONE_OPTION:
+        st.caption("Click a dot or choose a genre to see details.")
+    else:
+        st.markdown(f"**{genre_name}**")
+
+        wiki = fetch_wikipedia_lead(genre_name)
+        if wiki.get("paragraph"):
+            st.write(wiki["paragraph"])
+        else:
+            st.caption("No clear Wikipedia summary found for this genre name.")
+
+        if wiki.get("url"):
+            st.markdown(f"[Open Wikipedia article]({wiki['url']})")
+
+        st.divider()
+
+        client_id, client_secret = _get_spotify_creds()
+        if not client_id or not client_secret:
+            st.warning("Spotify keys not found in Streamlit Secrets.")
+            st.caption("Manage app → Settings → Secrets")
+        else:
+            artist = spotify_artist_from_wikipedia_links(wiki.get("lead_link_names", []), market=market)
+            if artist:
+                st.markdown(f"**Artist from Wikipedia lead:** {artist['name']}")
+                st.components.v1.html(spotify_embed_html("artist", artist["id"], height=352), height=370, scrolling=False)
+                if artist.get("url"):
+                    st.markdown(f"[Open in Spotify]({artist['url']})")
+            else:
+                ex = spotify_example_for_genre(genre_name, market=market)
+                if ex:
+                    st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
+                    st.components.v1.html(spotify_embed_html(ex["type"], ex["id"], height=152), height=170, scrolling=False)
+                    if ex.get("url"):
+                        st.markdown(f"[Open in Spotify]({ex['url']})")
+                else:
+                    st.caption("Couldn’t find a Spotify example for this genre name.")
+                    st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
