@@ -28,7 +28,7 @@ SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 NONE_OPTION = "— none —"
 
-# background color used for blending (matches plotly_dark feel)
+# background used for blending (keeps “faint” dots crisp without blur)
 BG_HEX = "#0b0f17"
 
 
@@ -72,10 +72,6 @@ def rgb_to_hex(rgb: Tuple[int, int, int]) -> str:
 
 
 def blend_hex(fg_hex: str, bg_hex: str, fg_strength: float) -> str:
-    """
-    fg_strength = 1.0 => fg
-    fg_strength = 0.0 => bg
-    """
     fg_strength = float(np.clip(fg_strength, 0.0, 1.0))
     fr, fg, fb = hex_to_rgb(fg_hex)
     br, bg, bb = hex_to_rgb(bg_hex)
@@ -109,7 +105,6 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["x", "y"]).copy()
 
-    # Colors: accept r/g/b or hex_colour
     if {"r", "g", "b"}.issubset(df.columns):
         for c in ["r", "g", "b"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -138,10 +133,14 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
 
 
 @st.cache_data(show_spinner=False)
-def stable_sample_genres(genres: pd.Series, n: int = 500) -> List[str]:
+def stable_label_sample(genres: pd.Series, n: int = 140) -> List[int]:
+    """
+    Pick a stable subset of label indices so the map isn’t unreadable.
+    Stable = based on hash so it doesn’t change between reruns.
+    """
     hashes = genres.astype(str).apply(lambda s: zlib.crc32(s.encode("utf-8")))
-    picked_idx = hashes.nsmallest(min(n, len(genres))).index
-    return genres.loc[picked_idx].sort_values().tolist()
+    picked = hashes.nsmallest(min(n, len(genres))).index.tolist()
+    return picked
 
 
 @st.cache_data(show_spinner=False)
@@ -253,6 +252,7 @@ def _fetch_lead_html(title: str) -> Optional[str]:
 def _extract_first_paragraph_links(lead_html: str) -> List[str]:
     if not lead_html:
         return []
+
     ps = re.findall(r"<p>(.*?)</p>", lead_html, flags=re.DOTALL | re.IGNORECASE)
     first_p = None
     for p in ps:
@@ -302,7 +302,6 @@ def fetch_wikipedia_lead(genre_name: str) -> Dict[str, object]:
 
     best = {"title": None, "paragraph": None, "url": None}
 
-    # exact title first
     try:
         direct = _fetch_page_intro_by_title(g)
         if direct.get("title") and norm_title(direct["title"]) not in banned_titles and direct.get("paragraph"):
@@ -310,7 +309,6 @@ def fetch_wikipedia_lead(genre_name: str) -> Dict[str, object]:
     except Exception:
         pass
 
-    # search candidates
     if not best.get("title"):
         candidates: List[str] = []
         queries = [
@@ -437,7 +435,6 @@ def spotify_search_artist(name: str, market: str = "AU") -> Optional[Dict[str, s
     if not tok:
         return None
     headers = {"Authorization": f"Bearer {tok}"}
-
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
@@ -472,9 +469,7 @@ def spotify_artist_from_wikipedia_links(link_names: List[str], market: str = "AU
 
     def candidate_score(n: str) -> int:
         nn = norm_title(n)
-        if not nn:
-            return -9999
-        if nn in blacklist:
+        if not nn or nn in blacklist:
             return -9999
         if len(nn) < 3 or len(nn) > 45:
             return -9999
@@ -499,7 +494,6 @@ def spotify_artist_from_wikipedia_links(link_names: List[str], market: str = "AU
         a = spotify_search_artist(name, market=market)
         if a:
             return a
-
     return None
 
 
@@ -589,7 +583,7 @@ def push_history(genre: str, max_len: int = 20):
 
 
 # =========================
-# Figure (stable traces -> no reset)
+# Figure helpers
 # =========================
 def build_edges_xy(X: np.ndarray, Y: np.ndarray, edges: List[Tuple[int, int, float]]) -> Tuple[List[float], List[float]]:
     xs, ys = [], []
@@ -626,6 +620,9 @@ def make_figure(
     path: List[int],
     show_labels: bool,
     neighbor_label_count: int,
+    default_label_idxs: List[int],
+    label_size: int,
+    axis_ranges: Tuple[Tuple[float, float], Tuple[float, float]],
 ) -> go.Figure:
     n = len(df_plot)
     X = df_plot["x"].astype(float).to_numpy()
@@ -639,10 +636,10 @@ def make_figure(
     has_selection = selected_idx is not None
     has_path = len(path) >= 2
 
-    # stable base edges
+    # base edges
     edges_x, edges_y = build_edges_xy(X, Y, edges_all)
 
-    # choose base color set
+    # base colors (crisp “faint” via blended colors, not opacity)
     if not has_selection:
         base_colors = C
     else:
@@ -655,7 +652,7 @@ def make_figure(
     elif has_selection and has_path:
         hi_idx = sorted(set([i for i in path if 0 <= i < n]))
 
-    # highlight lines (star or path)
+    # highlight lines
     hi_lx, hi_ly = [], []
     if has_selection and show_edges:
         if has_path:
@@ -663,31 +660,36 @@ def make_figure(
         else:
             hi_lx, hi_ly = build_star_xy(X, Y, selected_idx, adj)
 
-    # labels (limited)
+    # labels
     label_x, label_y, label_t = [], [], []
-    if has_selection and show_labels:
-        label_idxs: List[int] = []
-        if has_path:
-            if 0 <= path[0] < n:
-                label_idxs.append(path[0])
-            if 0 <= path[-1] < n:
-                label_idxs.append(path[-1])
+    if show_labels:
+        if not has_selection:
+            label_idxs = [i for i in default_label_idxs if 0 <= i < n]
         else:
-            label_idxs.append(selected_idx)
-            if neighbor_label_count > 0:
-                for i in sorted(list(neighbor_idxs))[:neighbor_label_count]:
-                    label_idxs.append(i)
-        label_idxs = sorted(set([i for i in label_idxs if 0 <= i < n]))
+            label_idxs: List[int] = []
+            if has_path:
+                if 0 <= path[0] < n:
+                    label_idxs.append(path[0])
+                if 0 <= path[-1] < n:
+                    label_idxs.append(path[-1])
+            else:
+                label_idxs.append(selected_idx)
+                if neighbor_label_count > 0:
+                    for i in sorted(list(neighbor_idxs))[:neighbor_label_count]:
+                        label_idxs.append(i)
+            label_idxs = sorted(set([i for i in label_idxs if 0 <= i < n]))
+
         label_x = [float(X[i]) for i in label_idxs]
         label_y = [float(Y[i]) for i in label_idxs]
         label_t = [str(G[i]) for i in label_idxs]
 
-    # make figure with ALWAYS the same trace structure
+    (xmin, xmax), (ymin, ymax) = axis_ranges
+
     fig = go.Figure()
 
-    # 0) global edges (always present; just fade when selected)
+    # 0) global edges (always present; fade when selected)
     fig.add_trace(
-        go.Scattergl(
+        go.Scatter(
             x=edges_x,
             y=edges_y,
             mode="lines",
@@ -701,35 +703,38 @@ def make_figure(
 
     # 1) base points (always present)
     fig.add_trace(
-        go.Scattergl(
+        go.Scatter(
             x=X,
             y=Y,
             mode="markers",
             marker=dict(size=9, color=base_colors, opacity=1.0),
+            text=G,
             customdata=IDX,
-            hoverinfo="skip",
+            hovertemplate="<b>%{text}</b><extra></extra>",
             showlegend=False,
             uid="points_base",
         )
     )
 
-    # 2) big invisible click targets (always present)
+    # 2) big invisible click targets (must be “selectable”)
+    # NOTE: This is deliberately tiny-visible to Plotly but still invisible to humans.
     fig.add_trace(
-        go.Scattergl(
+        go.Scatter(
             x=X,
             y=Y,
             mode="markers",
-            marker=dict(size=24, color="rgba(0,0,0,0.001)", opacity=0.001),
+            marker=dict(size=26, color="rgba(255,255,255,0.02)", opacity=0.02),
+            text=G,
             customdata=IDX,
-            hoverinfo="skip",
+            hovertemplate="<b>%{text}</b><extra></extra>",
             showlegend=False,
             uid="hit_targets",
         )
     )
 
-    # 3) highlight line(s) (always present; sometimes empty)
+    # 3) highlight line(s)
     fig.add_trace(
-        go.Scattergl(
+        go.Scatter(
             x=hi_lx,
             y=hi_ly,
             mode="lines",
@@ -740,34 +745,34 @@ def make_figure(
         )
     )
 
-    # 4) highlight points (always present; sometimes empty)
+    # 4) highlight points
     if hi_idx:
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=X[hi_idx],
                 y=Y[hi_idx],
                 mode="markers",
-                marker=dict(size=12, color=C[hi_idx], opacity=1.0),
+                marker=dict(size=13, color=C[hi_idx], opacity=1.0),
+                text=G[hi_idx],
                 customdata=IDX[hi_idx],
-                hoverinfo="skip",
+                hovertemplate="<b>%{text}</b><extra></extra>",
                 showlegend=False,
                 uid="points_highlight",
             )
         )
     else:
         fig.add_trace(
-            go.Scattergl(
+            go.Scatter(
                 x=[],
                 y=[],
                 mode="markers",
-                marker=dict(size=12, color=[]),
-                hoverinfo="skip",
+                marker=dict(size=13),
                 showlegend=False,
                 uid="points_highlight",
             )
         )
 
-    # 5) labels (always present; sometimes empty)
+    # 5) labels
     fig.add_trace(
         go.Scatter(
             x=label_x,
@@ -775,7 +780,7 @@ def make_figure(
             mode="text",
             text=label_t,
             textposition="top center",
-            textfont=dict(size=12, color="rgba(255,255,255,0.92)"),
+            textfont=dict(size=label_size, color="rgba(255,255,255,0.92)"),
             hoverinfo="skip",
             showlegend=False,
             uid="labels",
@@ -788,11 +793,13 @@ def make_figure(
         margin=dict(l=10, r=10, t=10, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
+        xaxis=dict(visible=False, range=[xmin, xmax]),
+        yaxis=dict(visible=False, range=[ymin, ymax]),
         dragmode="pan",
+        # IMPORTANT: click selects a point
         clickmode="event+select",
-        hovermode=False,
+        hovermode="closest",
+        # IMPORTANT: keep view between reruns
         uirevision="keep-view",
     )
     return fig
@@ -808,7 +815,6 @@ st.markdown(
 <style>
 div[data-baseweb="select"] * { cursor: pointer !important; }
 div[data-baseweb="select"] input { caret-color: transparent; }
-/* Make the plot clearly clickable */
 .js-plotly-plot, .js-plotly-plot * { cursor: pointer !important; }
 </style>
 """,
@@ -876,6 +882,7 @@ with st.sidebar:
     st.divider()
     st.header("Labels")
     show_labels = st.checkbox("Show map labels", value=True)
+    label_size = st.slider("Label size", 10, 20, 13)
     neighbor_label_count = st.slider("Neighbor labels (when selected)", 0, 20, 6)
 
     st.divider()
@@ -899,14 +906,21 @@ if view_mode == "Fit to screen":
     if y_max != y_min:
         df_plot["y"] = (df_plot["y"] - y_min) / (y_max - y_min)
 
-# Precompute crisp “faint” colors (no opacity blur)
-# - selection mode: keep some color
-# - path mode: even fainter
+# crisp faint colors
 df_plot["hex_faint_sel"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.28))
 df_plot["hex_faint_path"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.18))
 
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
 adj, undirected_edges = build_knn_graph(coords, k=k)
+
+# fixed axis ranges (prevents dropdown selection “reset”)
+xmin, xmax = float(df_plot["x"].min()), float(df_plot["x"].max())
+ymin, ymax = float(df_plot["y"].min()), float(df_plot["y"].max())
+pad_x = (xmax - xmin) * 0.05 if xmax > xmin else 1.0
+pad_y = (ymax - ymin) * 0.05 if ymax > ymin else 1.0
+axis_ranges = ((xmin - pad_x, xmax + pad_x), (ymin - pad_y, ymax + pad_y))
+
+default_label_idxs = stable_label_sample(df_plot["genre"], n=140)
 
 col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
 
@@ -958,7 +972,8 @@ with col_controls:
                 dest_mask = df["genre"].str.contains(dest_q.strip(), case=False, na=False)
                 end_candidates = df.loc[dest_mask, "genre"].tolist()
             else:
-                end_candidates = stable_sample_genres(df["genre"], n=500)
+                end_candidates = stable_label_sample(df["genre"], n=500)
+                end_candidates = df.loc[end_candidates, "genre"].tolist()
 
             if end_candidates:
                 end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
@@ -991,6 +1006,9 @@ with col_map:
         path=st.session_state.get("current_path", []),
         show_labels=show_labels,
         neighbor_label_count=neighbor_label_count,
+        default_label_idxs=default_label_idxs,
+        label_size=label_size,
+        axis_ranges=axis_ranges,
     )
 
     event = st.plotly_chart(
@@ -1001,7 +1019,7 @@ with col_map:
         config={"scrollZoom": True, "doubleClick": "reset", "displaylogo": False, "responsive": True},
     )
 
-    # Pick a clicked point that has customdata (ignore line traces etc.)
+    # Streamlit gives us selection events. A click should create a 1-point selection.
     sel = getattr(event, "selection", None)
     if sel is None and isinstance(event, dict):
         sel = event.get("selection")
@@ -1013,6 +1031,7 @@ with col_map:
             points = sel.get("points")
 
         if points:
+            # Find the first point with customdata (our index)
             for p in points:
                 cd = p.get("customdata")
                 if cd is not None:
