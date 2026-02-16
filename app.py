@@ -31,7 +31,7 @@ HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # Helpers
 # =========================
 def safe_hex(s: str) -> str:
-    """Guarantee a valid #RRGGBB string (Plotly can drop a marker trace if any are invalid)."""
+    """Guarantee a valid #RRGGBB string."""
     if s is None:
         return "#888888"
     s = str(s).strip()
@@ -92,9 +92,7 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
         else:
             df["hex_colour"] = df[hex_col]
 
-    # Ensure every color is valid
     df["hex_colour"] = df["hex_colour"].apply(safe_hex)
-
     return df.reset_index(drop=True)
 
 
@@ -357,41 +355,32 @@ def make_figure(
     selected_idx: int,
     neighbor_idxs: Set[int],
     adj: List[List[Tuple[int, float]]],
-    edges_local: List[Tuple[int, int, float]],
     show_edges: bool,
     path: Optional[List[int]],
 ) -> go.Figure:
     n = len(df_plot)
 
-    sizes = [6] * n
+    # Make the selected neighborhood obvious:
+    # - fade everything else
+    # - size up selected + neighbors
+    sizes = [5] * n
+    opacities = [0.18] * n  # dim background points so lines pop
+
     for i in neighbor_idxs:
-        sizes[i] = 10
-    sizes[selected_idx] = 14
+        sizes[i] = 9
+        opacities[i] = 0.95
+
+    sizes[selected_idx] = 13
+    opacities[selected_idx] = 1.0
+
     if path:
         for i in path:
-            sizes[i] = max(sizes[i], 10)
+            sizes[i] = max(sizes[i], 9)
+            opacities[i] = 1.0
 
     fig = go.Figure()
 
-    # 1) Local web of lines (selected + neighbors)
-    if show_edges and edges_local:
-        xs, ys = [], []
-        for u, v, _d in edges_local:
-            xs.extend([float(df_plot.at[u, "x"]), float(df_plot.at[v, "x"]), None])
-            ys.extend([float(df_plot.at[u, "y"]), float(df_plot.at[v, "y"]), None])
-
-        fig.add_trace(
-            go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines",
-                line=dict(width=1.2, color="rgba(120,160,255,0.35)"),
-                hoverinfo="skip",
-                showlegend=False,
-            )
-        )
-
-    # 2) Always-visible "star" from selected -> each nearest neighbor
+    # Connection lines: selected -> each nearest neighbor (thick + bright)
     if show_edges:
         sx, sy = float(df_plot.at[selected_idx, "x"]), float(df_plot.at[selected_idx, "y"])
         xs, ys = [], []
@@ -404,13 +393,13 @@ def make_figure(
                 x=xs,
                 y=ys,
                 mode="lines",
-                line=dict(width=2.0, color="rgba(160,200,255,0.55)"),
+                line=dict(width=3.0, color="rgba(255,255,255,0.65)"),
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
-    # 3) Path overlay (if any)
+    # Path overlay (even brighter)
     if path and len(path) >= 2:
         px, py = [], []
         for a, b in zip(path[:-1], path[1:]):
@@ -421,16 +410,16 @@ def make_figure(
                 x=px,
                 y=py,
                 mode="lines",
-                line=dict(width=3.0, color="rgba(255,255,255,0.7)"),
+                line=dict(width=4.0, color="rgba(120,200,255,0.9)"),
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
-    # 4) Points (dots)
+    # Dots (no outline = smoother zoom)
     x_vals = df_plot["x"].astype(float).tolist()
     y_vals = df_plot["y"].astype(float).tolist()
-    colors = df_plot["hex_colour"].apply(safe_hex).tolist()
+    colors = df_plot["hex_colour"].tolist()
 
     fig.add_trace(
         go.Scatter(
@@ -440,8 +429,7 @@ def make_figure(
             marker=dict(
                 size=sizes,
                 color=colors,
-                opacity=0.95,
-                line=dict(width=0.5, color="rgba(255,255,255,0.25)"),
+                opacity=opacities,  # per-dot opacity
             ),
             text=df_plot["genre"].tolist(),
             hovertemplate="<b>%{text}</b><extra></extra>",
@@ -563,7 +551,7 @@ if view_mode == "Fit to screen":
         df_plot["y"] = (df_plot["y"] - y_min) / (y_max - y_min)
 
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
-adj, undirected_edges = build_knn_graph(coords, k=k)
+adj, _undirected_edges = build_knn_graph(coords, k=k)
 
 col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
 
@@ -632,45 +620,40 @@ with col_map:
 
     show_edges = st.session_state.get("show_edges", True)
 
-    # Local edges among {selected + neighbors} so it stays readable
-    focus = {selected_idx} | neighbor_idxs
-    edges_local = [(u, v, d) for (u, v, d) in undirected_edges if u in focus and v in focus]
-
     fig = make_figure(
         df_plot=df_plot,
         selected_idx=selected_idx,
         neighbor_idxs=neighbor_idxs,
         adj=adj,
-        edges_local=edges_local,
         show_edges=show_edges,
         path=st.session_state.get("current_path") or None,
     )
 
-    # Use Streamlit's built-in plotly selection support (keeps scroll zoom working)
     event = st.plotly_chart(
         fig,
         key="genre_map",
         on_select="rerun",
         selection_mode="points",
-        config={"scrollZoom": True, "displaylogo": False},
+        config={
+            "scrollZoom": True,
+            "doubleClick": "reset",
+            "displaylogo": False,
+            "responsive": True,
+        },
     )
 
-    # Handle click selection (avoid rerun loops by only acting on NEW clicks)
-    try:
-        sel = event.selection
-    except Exception:
-        sel = event.get("selection") if isinstance(event, dict) else None
+    # Click selection
+    sel = getattr(event, "selection", None)
+    if sel is None and isinstance(event, dict):
+        sel = event.get("selection")
 
     if sel:
-        try:
-            points = sel.points
-        except Exception:
-            points = sel.get("points") if isinstance(sel, dict) else None
+        points = getattr(sel, "points", None)
+        if points is None and isinstance(sel, dict):
+            points = sel.get("points")
 
         if points and len(points) > 0:
-            # The points trace is always the LAST trace in the figure
-            points_curve = len(fig.data) - 1
-
+            points_curve = len(fig.data) - 1  # dots are last trace
             p0 = points[0]
             curve = p0.get("curve_number")
             idx = p0.get("point_index")
