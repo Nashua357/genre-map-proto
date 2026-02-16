@@ -26,6 +26,8 @@ SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
+NONE_OPTION = "— none —"
+
 
 # =========================
 # Helpers
@@ -341,6 +343,8 @@ def spotify_embed_html(item_type: str, item_id: str, height: int = 152) -> str:
 # Selection history
 # =========================
 def push_history(genre: str, max_len: int = 20):
+    if not genre or genre == NONE_OPTION:
+        return
     hist = st.session_state.setdefault("genre_history", [])
     if genre and (len(hist) == 0 or hist[0] != genre):
         hist = [genre] + [g for g in hist if g != genre]
@@ -352,90 +356,165 @@ def push_history(genre: str, max_len: int = 20):
 # =========================
 def make_figure(
     df_plot: pd.DataFrame,
-    selected_idx: int,
+    selected_idx: Optional[int],
     neighbor_idxs: Set[int],
+    edges_all: List[Tuple[int, int, float]],
     adj: List[List[Tuple[int, float]]],
     show_edges: bool,
-    path: Optional[List[int]],
+    path: List[int],
 ) -> go.Figure:
     n = len(df_plot)
-
-    # Make the selected neighborhood obvious:
-    # - fade everything else
-    # - size up selected + neighbors
-    sizes = [5] * n
-    opacities = [0.18] * n  # dim background points so lines pop
-
-    for i in neighbor_idxs:
-        sizes[i] = 9
-        opacities[i] = 0.95
-
-    sizes[selected_idx] = 13
-    opacities[selected_idx] = 1.0
-
-    if path:
-        for i in path:
-            sizes[i] = max(sizes[i], 9)
-            opacities[i] = 1.0
-
     fig = go.Figure()
 
-    # Connection lines: selected -> each nearest neighbor (thick + bright)
-    if show_edges:
-        sx, sy = float(df_plot.at[selected_idx, "x"]), float(df_plot.at[selected_idx, "y"])
-        xs, ys = [], []
-        for v, _d in adj[selected_idx]:
-            xs.extend([sx, float(df_plot.at[v, "x"]), None])
-            ys.extend([sy, float(df_plot.at[v, "y"]), None])
+    has_selection = selected_idx is not None
+    has_path = len(path) >= 2
 
+    # ---- MODE A: overview (no selection yet) ----
+    if not has_selection:
+        # Global lines first (so they are behind dots)
+        if show_edges and edges_all:
+            xs, ys = [], []
+            for u, v, _d in edges_all:
+                xs.extend([float(df_plot.at[u, "x"]), float(df_plot.at[v, "x"]), None])
+                ys.extend([float(df_plot.at[u, "y"]), float(df_plot.at[v, "y"]), None])
+            fig.add_trace(
+                go.Scatter(
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    line=dict(width=0.9, color="rgba(150,180,255,0.22)"),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
+
+        # Dots fully visible
         fig.add_trace(
             go.Scatter(
-                x=xs,
-                y=ys,
-                mode="lines",
-                line=dict(width=3.0, color="rgba(255,255,255,0.65)"),
-                hoverinfo="skip",
+                x=df_plot["x"].astype(float).tolist(),
+                y=df_plot["y"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(
+                    size=6,
+                    color=df_plot["hex_colour"].tolist(),
+                    opacity=0.9,
+                ),
+                text=df_plot["genre"].tolist(),
+                hovertemplate="<b>%{text}</b><extra></extra>",
                 showlegend=False,
             )
         )
 
-    # Path overlay (even brighter)
-    if path and len(path) >= 2:
-        px, py = [], []
-        for a, b in zip(path[:-1], path[1:]):
-            px.extend([float(df_plot.at[a, "x"]), float(df_plot.at[b, "x"]), None])
-            py.extend([float(df_plot.at[a, "y"]), float(df_plot.at[b, "y"]), None])
+    # ---- MODE B/C: selection OR path ----
+    else:
+        # Sizes + opacities depend on whether path exists
+        sizes = [5] * n
+        opacities = [0.28] * n  # faint background (but still visible)
+
+        if has_path:
+            # background fainter when path is active
+            opacities = [0.16] * n
+
+            # highlight path nodes
+            for i in path:
+                if 0 <= i < n:
+                    sizes[i] = 10
+                    opacities[i] = 1.0
+
+            # make start/end extra visible
+            sizes[path[0]] = 14
+            sizes[path[-1]] = 14
+            opacities[path[0]] = 1.0
+            opacities[path[-1]] = 1.0
+
+        else:
+            # selection mode: selected + neighbors bright
+            for i in neighbor_idxs:
+                sizes[i] = 9
+                opacities[i] = 0.95
+            sizes[selected_idx] = 14
+            opacities[selected_idx] = 1.0
+
+        # Lines
+        if show_edges:
+            if has_path:
+                # draw ONLY the path line clearly
+                px, py = [], []
+                for a, b in zip(path[:-1], path[1:]):
+                    px.extend([float(df_plot.at[a, "x"]), float(df_plot.at[b, "x"]), None])
+                    py.extend([float(df_plot.at[a, "y"]), float(df_plot.at[b, "y"]), None])
+                fig.add_trace(
+                    go.Scatter(
+                        x=px,
+                        y=py,
+                        mode="lines",
+                        line=dict(width=4.0, color="rgba(120,200,255,0.92)"),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
+            else:
+                # draw selected -> neighbor "star" (very clear)
+                sx, sy = float(df_plot.at[selected_idx, "x"]), float(df_plot.at[selected_idx, "y"])
+                xs, ys = [], []
+                for v, _d in adj[selected_idx]:
+                    xs.extend([sx, float(df_plot.at[v, "x"]), None])
+                    ys.extend([sy, float(df_plot.at[v, "y"]), None])
+                fig.add_trace(
+                    go.Scatter(
+                        x=xs,
+                        y=ys,
+                        mode="lines",
+                        line=dict(width=3.2, color="rgba(255,255,255,0.72)"),
+                        hoverinfo="skip",
+                        showlegend=False,
+                    )
+                )
+
+        # Dots (no outline = smoother)
         fig.add_trace(
             go.Scatter(
-                x=px,
-                y=py,
-                mode="lines",
-                line=dict(width=4.0, color="rgba(120,200,255,0.9)"),
-                hoverinfo="skip",
+                x=df_plot["x"].astype(float).tolist(),
+                y=df_plot["y"].astype(float).tolist(),
+                mode="markers",
+                marker=dict(
+                    size=sizes,
+                    color=df_plot["hex_colour"].tolist(),
+                    opacity=opacities,
+                ),
+                text=df_plot["genre"].tolist(),
+                hovertemplate="<b>%{text}</b><extra></extra>",
                 showlegend=False,
             )
         )
 
-    # Dots (no outline = smoother zoom)
-    x_vals = df_plot["x"].astype(float).tolist()
-    y_vals = df_plot["y"].astype(float).tolist()
-    colors = df_plot["hex_colour"].tolist()
+        # On-map labels (so you can read without hover/cursor)
+        label_idxs: List[int] = []
+        if has_path:
+            # label start, end, and a few along the way (every ~5 steps)
+            label_idxs = [path[0], path[-1]]
+            for j in range(1, len(path) - 1):
+                if j % 5 == 0:
+                    label_idxs.append(path[j])
+            # de-dupe
+            label_idxs = sorted(set([i for i in label_idxs if 0 <= i < n]))
+        else:
+            # label selected + its neighbors
+            label_idxs = sorted(set([selected_idx] + list(neighbor_idxs)))
 
-    fig.add_trace(
-        go.Scatter(
-            x=x_vals,
-            y=y_vals,
-            mode="markers",
-            marker=dict(
-                size=sizes,
-                color=colors,
-                opacity=opacities,  # per-dot opacity
-            ),
-            text=df_plot["genre"].tolist(),
-            hovertemplate="<b>%{text}</b><extra></extra>",
-            showlegend=False,
-        )
-    )
+        if label_idxs:
+            fig.add_trace(
+                go.Scatter(
+                    x=[float(df_plot.at[i, "x"]) for i in label_idxs],
+                    y=[float(df_plot.at[i, "y"]) for i in label_idxs],
+                    mode="text",
+                    text=[df_plot.at[i, "genre"] for i in label_idxs],
+                    textposition="top center",
+                    textfont=dict(size=12, color="rgba(255,255,255,0.92)"),
+                    hoverinfo="skip",
+                    showlegend=False,
+                )
+            )
 
     fig.update_layout(
         template="plotly_dark",
@@ -474,6 +553,18 @@ st.title("Phase 1 Prototype — Genre Map")
 pending = st.session_state.pop("pending_genre", None)
 if pending:
     st.session_state["selected_genre_dropdown"] = pending
+    # clear any existing path when changing selection by click
+    st.session_state["current_path"] = []
+    st.session_state["path_message"] = ""
+
+# Default state: no selection on first load
+if "selected_genre_dropdown" not in st.session_state:
+    st.session_state["selected_genre_dropdown"] = NONE_OPTION
+
+if "current_path" not in st.session_state:
+    st.session_state["current_path"] = []
+if "path_message" not in st.session_state:
+    st.session_state["path_message"] = ""
 
 # Sidebar
 with st.sidebar:
@@ -486,6 +577,8 @@ with st.sidebar:
             if st.button(g, key=f"hist_{i}", use_container_width=True):
                 st.session_state["selected_genre_dropdown"] = g
                 st.session_state["pending_genre"] = g
+                st.session_state["current_path"] = []
+                st.session_state["path_message"] = ""
                 st.rerun()
         cols = st.columns(2)
         with cols[0]:
@@ -525,21 +618,6 @@ with st.sidebar:
 # Load data
 df = load_genre_data("upload" if source == "Upload CSV" else "web", uploaded_bytes)
 
-if "selected_genre_dropdown" not in st.session_state:
-    st.session_state["selected_genre_dropdown"] = df["genre"].iloc[0] if len(df) else ""
-
-# Reset path if selected genre changes
-prev_sel = st.session_state.get("prev_selected_genre")
-if prev_sel != st.session_state["selected_genre_dropdown"]:
-    st.session_state["prev_selected_genre"] = st.session_state["selected_genre_dropdown"]
-    st.session_state["current_path"] = []
-    st.session_state["path_message"] = ""
-
-if "current_path" not in st.session_state:
-    st.session_state["current_path"] = []
-if "path_message" not in st.session_state:
-    st.session_state["path_message"] = ""
-
 # Prepare plot coords
 df_plot = df.copy()
 if view_mode == "Fit to screen":
@@ -551,7 +629,7 @@ if view_mode == "Fit to screen":
         df_plot["y"] = (df_plot["y"] - y_min) / (y_max - y_min)
 
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
-adj, _undirected_edges = build_knn_graph(coords, k=k)
+adj, undirected_edges = build_knn_graph(coords, k=k)
 
 col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
 
@@ -566,47 +644,62 @@ with col_controls:
     else:
         candidates = df["genre"].head(800).tolist()
 
-    if not candidates:
-        st.warning("No matches.")
-        st.stop()
+    options = [NONE_OPTION] + candidates
 
+    # keep current selection if it isn't in candidates list
     cur = st.session_state["selected_genre_dropdown"]
-    if cur and cur not in candidates and cur in df["genre"].values:
-        candidates = [cur] + candidates
+    if cur not in options and cur in df["genre"].values:
+        options = [NONE_OPTION, cur] + candidates
 
-    chosen = st.selectbox("Selected genre", candidates, index=0, key="selected_genre_dropdown")
-    push_history(chosen)
+    chosen = st.selectbox("Selected genre", options, index=options.index(cur) if cur in options else 0, key="selected_genre_dropdown")
 
-    selected_idx = int(df.index[df["genre"] == chosen][0])
-    neighbor_idxs = {v for v, _d in adj[selected_idx]}
-    neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
+    # clear path whenever the dropdown changes selection
+    if st.session_state.get("prev_dropdown") != chosen:
+        st.session_state["prev_dropdown"] = chosen
+        st.session_state["current_path"] = []
+        st.session_state["path_message"] = ""
 
-    st.caption("Closest genres")
-    st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
+    if chosen != NONE_OPTION:
+        push_history(chosen)
 
+        selected_idx = int(df.index[df["genre"] == chosen][0])
+        neighbor_idxs = {v for v, _d in adj[selected_idx]}
+        neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
+
+        st.caption("Closest genres")
+        st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
+    else:
+        selected_idx = None
+        neighbor_idxs = set()
+        st.caption("Closest genres")
+        st.write("Select a genre to show its nearest neighbors.")
+
+    # Path finder (only if a start genre is selected)
     if st.session_state.get("enable_path", True):
         st.markdown("### Path finder")
-        dest_q = st.text_input("Search destination", value="", key="dest_query")
-
-        if dest_q.strip():
-            dest_mask = df["genre"].str.contains(dest_q.strip(), case=False, na=False)
-            end_candidates = df.loc[dest_mask, "genre"].tolist()
+        if chosen == NONE_OPTION:
+            st.info("Pick a start genre first, then you can find a path.")
         else:
-            end_candidates = stable_sample_genres(df["genre"], n=500)
+            dest_q = st.text_input("Search destination", value="", key="dest_query")
 
-        if end_candidates:
-            end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
-            st.markdown('<div style="height: 90px;"></div>', unsafe_allow_html=True)
+            if dest_q.strip():
+                dest_mask = df["genre"].str.contains(dest_q.strip(), case=False, na=False)
+                end_candidates = df.loc[dest_mask, "genre"].tolist()
+            else:
+                end_candidates = stable_sample_genres(df["genre"], n=500)
 
-            if st.button("Find shortest path"):
-                end_idx = int(df.index[df["genre"] == end][0])
-                path = dijkstra_path(adj, selected_idx, end_idx)
-                st.session_state["current_path"] = path
-                if path:
-                    st.session_state["path_message"] = f"Path found: {len(path)} steps."
-                else:
-                    st.session_state["path_message"] = "No path found. Try increasing connections."
-                st.rerun()
+            if end_candidates:
+                end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
+
+                if st.button("Find shortest path"):
+                    end_idx = int(df.index[df["genre"] == end][0])
+                    path = dijkstra_path(adj, selected_idx, end_idx)
+                    st.session_state["current_path"] = path
+                    if path:
+                        st.session_state["path_message"] = f"Path found: {len(path)} steps."
+                    else:
+                        st.session_state["path_message"] = "No path found. Try increasing connections."
+                    st.rerun()
 
     if st.session_state.get("path_message"):
         if st.session_state["current_path"]:
@@ -624,9 +717,10 @@ with col_map:
         df_plot=df_plot,
         selected_idx=selected_idx,
         neighbor_idxs=neighbor_idxs,
+        edges_all=undirected_edges,
         adj=adj,
         show_edges=show_edges,
-        path=st.session_state.get("current_path") or None,
+        path=st.session_state.get("current_path", []),
     )
 
     event = st.plotly_chart(
@@ -642,7 +736,7 @@ with col_map:
         },
     )
 
-    # Click selection
+    # Click selection: only act when clicking the dots trace (last marker trace)
     sel = getattr(event, "selection", None)
     if sel is None and isinstance(event, dict):
         sel = event.get("selection")
@@ -653,53 +747,61 @@ with col_map:
             points = sel.get("points")
 
         if points and len(points) > 0:
-            points_curve = len(fig.data) - 1  # dots are last trace
+            # Our dots trace is always the LAST trace with markers.
+            # We keep it as the last trace in make_figure().
+            dots_curve = None
+            for i in range(len(fig.data) - 1, -1, -1):
+                if getattr(fig.data[i], "mode", "") and "markers" in fig.data[i].mode:
+                    dots_curve = i
+                    break
+
             p0 = points[0]
             curve = p0.get("curve_number")
             idx = p0.get("point_index")
 
-            if curve == points_curve and idx is not None:
+            if dots_curve is not None and curve == dots_curve and idx is not None:
                 idx = int(idx)
-                if st.session_state.get("last_click_idx") != idx:
-                    st.session_state["last_click_idx"] = idx
-                    clicked_genre = df.loc[idx, "genre"]
-                    st.session_state["pending_genre"] = clicked_genre
-                    push_history(clicked_genre)
-                    st.rerun()
+                if 0 <= idx < len(df):
+                    if st.session_state.get("last_click_idx") != idx:
+                        st.session_state["last_click_idx"] = idx
+                        clicked_genre = df.loc[idx, "genre"]
+                        st.session_state["pending_genre"] = clicked_genre
+                        push_history(clicked_genre)
+                        st.rerun()
 
 # ---------------- Details column ----------------
 with col_details:
     st.subheader("Genre details")
-    genre_name = st.session_state.get("selected_genre_dropdown", "")
 
-    if not genre_name:
-        st.info("Select a genre to see details.")
-        st.stop()
+    genre_name = st.session_state.get("selected_genre_dropdown", NONE_OPTION)
 
-    st.markdown(f"**{genre_name}**")
-
-    wiki = fetch_wikipedia_intro(genre_name)
-    if wiki.get("paragraph"):
-        st.write(wiki["paragraph"])
+    if genre_name == NONE_OPTION:
+        st.caption("Click a dot or choose a genre to see details.")
     else:
-        st.caption("No clear Wikipedia summary found for this genre name.")
+        st.markdown(f"**{genre_name}**")
 
-    if wiki.get("url"):
-        st.markdown(f"[Open Wikipedia article]({wiki['url']})")
-
-    st.divider()
-
-    client_id, client_secret = _get_spotify_creds()
-    if not client_id or not client_secret:
-        st.warning("Spotify keys not found in Streamlit Secrets.")
-        st.caption("Manage app → Settings → Secrets")
-    else:
-        ex = spotify_example_for_genre(genre_name, market=market)
-        if ex:
-            st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
-            st.components.v1.html(spotify_embed_html(ex["type"], ex["id"], height=152), height=170, scrolling=False)
-            if ex.get("url"):
-                st.markdown(f"[Open in Spotify]({ex['url']})")
+        wiki = fetch_wikipedia_intro(genre_name)
+        if wiki.get("paragraph"):
+            st.write(wiki["paragraph"])
         else:
-            st.caption("Couldn’t find a Spotify example for this exact genre name.")
-            st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
+            st.caption("No clear Wikipedia summary found for this genre name.")
+
+        if wiki.get("url"):
+            st.markdown(f"[Open Wikipedia article]({wiki['url']})")
+
+        st.divider()
+
+        client_id, client_secret = _get_spotify_creds()
+        if not client_id or not client_secret:
+            st.warning("Spotify keys not found in Streamlit Secrets.")
+            st.caption("Manage app → Settings → Secrets")
+        else:
+            ex = spotify_example_for_genre(genre_name, market=market)
+            if ex:
+                st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
+                st.components.v1.html(spotify_embed_html(ex["type"], ex["id"], height=152), height=170, scrolling=False)
+                if ex.get("url"):
+                    st.markdown(f"[Open in Spotify]({ex['url']})")
+            else:
+                st.caption("Couldn’t find a Spotify example for this exact genre name.")
+                st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
