@@ -12,7 +12,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 from sklearn.neighbors import NearestNeighbors
-from streamlit_plotly_events import plotly_events
 
 # =========================
 # URLs
@@ -32,7 +31,7 @@ HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 # Helpers
 # =========================
 def safe_hex(s: str) -> str:
-    """Guarantee a valid #RRGGBB string (Plotly will drop the whole trace if any are invalid)."""
+    """Guarantee a valid #RRGGBB string (Plotly can drop a marker trace if any are invalid)."""
     if s is None:
         return "#888888"
     s = str(s).strip()
@@ -93,7 +92,7 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
         else:
             df["hex_colour"] = df[hex_col]
 
-    # CRITICAL: sanitize every value so Plotly never drops the marker trace
+    # Ensure every color is valid
     df["hex_colour"] = df["hex_colour"].apply(safe_hex)
 
     return df.reset_index(drop=True)
@@ -351,19 +350,19 @@ def push_history(genre: str, max_len: int = 20):
 
 
 # =========================
-# Plotly figure (DOTS GUARANTEED)
+# Plotly figure
 # =========================
 def make_figure(
     df_plot: pd.DataFrame,
     selected_idx: int,
     neighbor_idxs: Set[int],
-    edges: List[Tuple[int, int, float]],
+    adj: List[List[Tuple[int, float]]],
+    edges_local: List[Tuple[int, int, float]],
     show_edges: bool,
     path: Optional[List[int]],
 ) -> go.Figure:
     n = len(df_plot)
 
-    # Sizes (as plain python lists for maximum compatibility)
     sizes = [6] * n
     for i in neighbor_idxs:
         sizes[i] = 10
@@ -374,25 +373,44 @@ def make_figure(
 
     fig = go.Figure()
 
-    # Optional edges
-    if show_edges and edges:
+    # 1) Local web of lines (selected + neighbors)
+    if show_edges and edges_local:
         xs, ys = [], []
-        for u, v, _d in edges:
+        for u, v, _d in edges_local:
             xs.extend([float(df_plot.at[u, "x"]), float(df_plot.at[v, "x"]), None])
             ys.extend([float(df_plot.at[u, "y"]), float(df_plot.at[v, "y"]), None])
+
         fig.add_trace(
             go.Scatter(
                 x=xs,
                 y=ys,
                 mode="lines",
-                line=dict(width=1),
-                opacity=0.35,
+                line=dict(width=1.2, color="rgba(120,160,255,0.35)"),
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
-    # Path overlay
+    # 2) Always-visible "star" from selected -> each nearest neighbor
+    if show_edges:
+        sx, sy = float(df_plot.at[selected_idx, "x"]), float(df_plot.at[selected_idx, "y"])
+        xs, ys = [], []
+        for v, _d in adj[selected_idx]:
+            xs.extend([sx, float(df_plot.at[v, "x"]), None])
+            ys.extend([sy, float(df_plot.at[v, "y"]), None])
+
+        fig.add_trace(
+            go.Scatter(
+                x=xs,
+                y=ys,
+                mode="lines",
+                line=dict(width=2.0, color="rgba(160,200,255,0.55)"),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+
+    # 3) Path overlay (if any)
     if path and len(path) >= 2:
         px, py = [], []
         for a, b in zip(path[:-1], path[1:]):
@@ -403,14 +421,13 @@ def make_figure(
                 x=px,
                 y=py,
                 mode="lines",
-                line=dict(width=3),
-                opacity=0.85,
+                line=dict(width=3.0, color="rgba(255,255,255,0.7)"),
                 hoverinfo="skip",
                 showlegend=False,
             )
         )
 
-    # Points (this is the key fix)
+    # 4) Points (dots)
     x_vals = df_plot["x"].astype(float).tolist()
     y_vals = df_plot["y"].astype(float).tolist()
     colors = df_plot["hex_colour"].apply(safe_hex).tolist()
@@ -423,7 +440,7 @@ def make_figure(
             marker=dict(
                 size=sizes,
                 color=colors,
-                opacity=0.95,  # single scalar opacity (reliable)
+                opacity=0.95,
                 line=dict(width=0.5, color="rgba(255,255,255,0.25)"),
             ),
             text=df_plot["genre"].tolist(),
@@ -441,6 +458,8 @@ def make_figure(
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
         dragmode="pan",
+        clickmode="event+select",
+        hovermode="closest",
         uirevision="keep",
     )
     return fig
@@ -484,6 +503,8 @@ with st.sidebar:
         with cols[0]:
             if st.button("Clear", use_container_width=True):
                 st.session_state["genre_history"] = []
+                st.session_state["current_path"] = []
+                st.session_state["path_message"] = ""
                 st.rerun()
         with cols[1]:
             st.caption(f"{len(hist)} saved")
@@ -518,6 +539,18 @@ df = load_genre_data("upload" if source == "Upload CSV" else "web", uploaded_byt
 
 if "selected_genre_dropdown" not in st.session_state:
     st.session_state["selected_genre_dropdown"] = df["genre"].iloc[0] if len(df) else ""
+
+# Reset path if selected genre changes
+prev_sel = st.session_state.get("prev_selected_genre")
+if prev_sel != st.session_state["selected_genre_dropdown"]:
+    st.session_state["prev_selected_genre"] = st.session_state["selected_genre_dropdown"]
+    st.session_state["current_path"] = []
+    st.session_state["path_message"] = ""
+
+if "current_path" not in st.session_state:
+    st.session_state["current_path"] = []
+if "path_message" not in st.session_state:
+    st.session_state["path_message"] = ""
 
 # Prepare plot coords
 df_plot = df.copy()
@@ -563,7 +596,6 @@ with col_controls:
     st.caption("Closest genres")
     st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
 
-    path: List[int] = []
     if st.session_state.get("enable_path", True):
         st.markdown("### Path finder")
         dest_q = st.text_input("Search destination", value="", key="dest_query")
@@ -581,10 +613,18 @@ with col_controls:
             if st.button("Find shortest path"):
                 end_idx = int(df.index[df["genre"] == end][0])
                 path = dijkstra_path(adj, selected_idx, end_idx)
+                st.session_state["current_path"] = path
                 if path:
-                    st.success(f"Path found: {len(path)} steps.")
+                    st.session_state["path_message"] = f"Path found: {len(path)} steps."
                 else:
-                    st.error("No path found. Try increasing connections.")
+                    st.session_state["path_message"] = "No path found. Try increasing connections."
+                st.rerun()
+
+    if st.session_state.get("path_message"):
+        if st.session_state["current_path"]:
+            st.success(st.session_state["path_message"])
+        else:
+            st.error(st.session_state["path_message"])
 
 # ---------------- Map column ----------------
 with col_map:
@@ -592,47 +632,57 @@ with col_map:
 
     show_edges = st.session_state.get("show_edges", True)
 
-    # Draw only local edges (clean) unless a path exists
-    if path and len(path) >= 2:
-        edges_to_draw = []
-    else:
-        focus = {selected_idx} | neighbor_idxs
-        edges_to_draw = [(u, v, d) for (u, v, d) in undirected_edges if u in focus and v in focus]
+    # Local edges among {selected + neighbors} so it stays readable
+    focus = {selected_idx} | neighbor_idxs
+    edges_local = [(u, v, d) for (u, v, d) in undirected_edges if u in focus and v in focus]
 
     fig = make_figure(
         df_plot=df_plot,
         selected_idx=selected_idx,
         neighbor_idxs=neighbor_idxs,
-        edges=edges_to_draw,
+        adj=adj,
+        edges_local=edges_local,
         show_edges=show_edges,
-        path=path if path else None,
+        path=st.session_state.get("current_path") or None,
     )
 
-    clicked = plotly_events(
+    # Use Streamlit's built-in plotly selection support (keeps scroll zoom working)
+    event = st.plotly_chart(
         fig,
-        click_event=True,
-        select_event=False,
-        hover_event=False,
-        override_height=720,
-        key="plotly_click",
+        key="genre_map",
+        on_select="rerun",
+        selection_mode="points",
+        config={"scrollZoom": True, "displaylogo": False},
     )
 
-    if clicked:
-        evt = clicked[0]
-        curve = evt.get("curveNumber", None)
+    # Handle click selection (avoid rerun loops by only acting on NEW clicks)
+    try:
+        sel = event.selection
+    except Exception:
+        sel = event.get("selection") if isinstance(event, dict) else None
 
-        # points trace index = 1 if edges trace exists and is being drawn, otherwise 0
-        points_trace_idx = 1 if (show_edges and len(edges_to_draw) > 0) else 0
+    if sel:
+        try:
+            points = sel.points
+        except Exception:
+            points = sel.get("points") if isinstance(sel, dict) else None
 
-        if curve == points_trace_idx:
-            pi = evt.get("pointIndex")
-            if pi is None:
-                pi = evt.get("pointNumber")
-            if pi is not None and 0 <= int(pi) < len(df):
-                clicked_genre = df.loc[int(pi), "genre"]
-                st.session_state["pending_genre"] = clicked_genre
-                push_history(clicked_genre)
-                st.rerun()
+        if points and len(points) > 0:
+            # The points trace is always the LAST trace in the figure
+            points_curve = len(fig.data) - 1
+
+            p0 = points[0]
+            curve = p0.get("curve_number")
+            idx = p0.get("point_index")
+
+            if curve == points_curve and idx is not None:
+                idx = int(idx)
+                if st.session_state.get("last_click_idx") != idx:
+                    st.session_state["last_click_idx"] = idx
+                    clicked_genre = df.loc[idx, "genre"]
+                    st.session_state["pending_genre"] = clicked_genre
+                    push_history(clicked_genre)
+                    st.rerun()
 
 # ---------------- Details column ----------------
 with col_details:
