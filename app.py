@@ -1,5 +1,6 @@
 import base64
 import heapq
+import re
 import time
 import zlib
 from typing import Optional, List, Tuple, Dict, Set
@@ -18,12 +19,30 @@ from streamlit_plotly_events import plotly_events
 # =========================
 DATA_URL = "https://raw.githubusercontent.com/AyrtonB/EveryNoise-Watch/main/data/genre_attrs.csv"
 
-# Wikipedia MediaWiki API (more reliable than REST summary for our use)
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 WIKI_UA = "genre-map-proto/1.0 (personal project)"
 
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
+
+HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+# =========================
+# Helpers
+# =========================
+def safe_hex(s: str) -> str:
+    """Guarantee a valid #RRGGBB string (Plotly will drop the whole trace if any are invalid)."""
+    if s is None:
+        return "#888888"
+    s = str(s).strip()
+    if not s:
+        return "#888888"
+    if not s.startswith("#"):
+        s = "#" + s
+    if HEX_RE.match(s):
+        return s
+    return "#888888"
 
 
 # =========================
@@ -72,12 +91,12 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
         if hex_col is None:
             df["hex_colour"] = "#888888"
         else:
-            h = df[hex_col].astype(str).str.strip()
-            h = h.apply(lambda s: ("#" + s.lstrip("#")) if len(s.lstrip("#")) == 6 else "#888888")
-            df["hex_colour"] = h
+            df["hex_colour"] = df[hex_col]
 
-    df = df.reset_index(drop=True)
-    return df
+    # CRITICAL: sanitize every value so Plotly never drops the marker trace
+    df["hex_colour"] = df["hex_colour"].apply(safe_hex)
+
+    return df.reset_index(drop=True)
 
 
 @st.cache_data(show_spinner=False)
@@ -145,13 +164,8 @@ def dijkstra_path(adj: List[List[Tuple[int, float]]], start: int, goal: int) -> 
 # =========================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_wikipedia_intro(genre_name: str) -> Dict[str, Optional[str]]:
-    """
-    Robust: search -> fetch intro extract + canonical url (all via MediaWiki API).
-    Returns {title, paragraph, url}.
-    """
     headers = {"User-Agent": WIKI_UA}
 
-    # 1) Search for best page
     queries = [
         f"{genre_name} music genre",
         f"{genre_name} (music)",
@@ -163,13 +177,7 @@ def fetch_wikipedia_intro(genre_name: str) -> Dict[str, Optional[str]]:
         try:
             r = requests.get(
                 WIKI_API,
-                params={
-                    "action": "query",
-                    "list": "search",
-                    "srsearch": q,
-                    "srlimit": 1,
-                    "format": "json",
-                },
+                params={"action": "query", "list": "search", "srsearch": q, "srlimit": 1, "format": "json"},
                 headers=headers,
                 timeout=15,
             )
@@ -186,7 +194,6 @@ def fetch_wikipedia_intro(genre_name: str) -> Dict[str, Optional[str]]:
     if not title:
         return {"title": None, "paragraph": None, "url": None}
 
-    # 2) Fetch first paragraph + full URL
     try:
         r2 = requests.get(
             WIKI_API,
@@ -269,7 +276,7 @@ def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[D
 
     headers = {"Authorization": f"Bearer {tok}"}
 
-    # 1) Track search with genre:"..."
+    # Track search with genre:"..."
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
@@ -293,7 +300,7 @@ def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[D
     except Exception:
         pass
 
-    # 2) Playlist fallback
+    # Playlist fallback
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
@@ -344,7 +351,7 @@ def push_history(genre: str, max_len: int = 20):
 
 
 # =========================
-# Plotly figure
+# Plotly figure (DOTS GUARANTEED)
 # =========================
 def make_figure(
     df_plot: pd.DataFrame,
@@ -356,28 +363,23 @@ def make_figure(
 ) -> go.Figure:
     n = len(df_plot)
 
-    size = np.full(n, 7.0)
-    opacity = np.full(n, 0.80)
-
+    # Sizes (as plain python lists for maximum compatibility)
+    sizes = [6] * n
     for i in neighbor_idxs:
-        size[i] = 11.0
-        opacity[i] = 1.0
-
-    size[selected_idx] = 16.0
-    opacity[selected_idx] = 1.0
-
+        sizes[i] = 10
+    sizes[selected_idx] = 14
     if path:
         for i in path:
-            size[i] = max(size[i], 12.0)
-            opacity[i] = 1.0
+            sizes[i] = max(sizes[i], 10)
 
     fig = go.Figure()
 
+    # Optional edges
     if show_edges and edges:
         xs, ys = [], []
         for u, v, _d in edges:
-            xs.extend([df_plot.at[u, "x"], df_plot.at[v, "x"], None])
-            ys.extend([df_plot.at[u, "y"], df_plot.at[v, "y"], None])
+            xs.extend([float(df_plot.at[u, "x"]), float(df_plot.at[v, "x"]), None])
+            ys.extend([float(df_plot.at[u, "y"]), float(df_plot.at[v, "y"]), None])
         fig.add_trace(
             go.Scatter(
                 x=xs,
@@ -390,11 +392,12 @@ def make_figure(
             )
         )
 
+    # Path overlay
     if path and len(path) >= 2:
         px, py = [], []
         for a, b in zip(path[:-1], path[1:]):
-            px.extend([df_plot.at[a, "x"], df_plot.at[b, "x"], None])
-            py.extend([df_plot.at[a, "y"], df_plot.at[b, "y"], None])
+            px.extend([float(df_plot.at[a, "x"]), float(df_plot.at[b, "x"]), None])
+            py.extend([float(df_plot.at[a, "y"]), float(df_plot.at[b, "y"]), None])
         fig.add_trace(
             go.Scatter(
                 x=px,
@@ -407,18 +410,23 @@ def make_figure(
             )
         )
 
+    # Points (this is the key fix)
+    x_vals = df_plot["x"].astype(float).tolist()
+    y_vals = df_plot["y"].astype(float).tolist()
+    colors = df_plot["hex_colour"].apply(safe_hex).tolist()
+
     fig.add_trace(
         go.Scatter(
-            x=df_plot["x"],
-            y=df_plot["y"],
+            x=x_vals,
+            y=y_vals,
             mode="markers",
             marker=dict(
-                size=size,
-                color=df_plot["hex_colour"].tolist(),
-                opacity=opacity,
-                symbol="circle",
+                size=sizes,
+                color=colors,
+                opacity=0.95,  # single scalar opacity (reliable)
+                line=dict(width=0.5, color="rgba(255,255,255,0.25)"),
             ),
-            text=df_plot["genre"],
+            text=df_plot["genre"].tolist(),
             hovertemplate="<b>%{text}</b><extra></extra>",
             showlegend=False,
         )
@@ -433,6 +441,7 @@ def make_figure(
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
         dragmode="pan",
+        uirevision="keep",
     )
     return fig
 
@@ -454,10 +463,12 @@ div[data-baseweb="select"] input { caret-color: transparent; }
 
 st.title("Phase 1 Prototype — Genre Map")
 
+# Apply pending click selection BEFORE widgets are created
 pending = st.session_state.pop("pending_genre", None)
 if pending:
     st.session_state["selected_genre_dropdown"] = pending
 
+# Sidebar
 with st.sidebar:
     st.header("Selection history")
     hist = st.session_state.get("genre_history", [])
@@ -491,7 +502,6 @@ with st.sidebar:
     st.divider()
     st.header("Connections")
     k = st.slider("Connections per genre", 2, 20, 8)
-
     st.checkbox("Show connection lines", value=True, key="show_edges")
     st.checkbox("Enable path finder", value=True, key="enable_path")
 
@@ -503,11 +513,13 @@ with st.sidebar:
     st.header("View")
     view_mode = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
 
+# Load data
 df = load_genre_data("upload" if source == "Upload CSV" else "web", uploaded_bytes)
 
 if "selected_genre_dropdown" not in st.session_state:
     st.session_state["selected_genre_dropdown"] = df["genre"].iloc[0] if len(df) else ""
 
+# Prepare plot coords
 df_plot = df.copy()
 if view_mode == "Fit to screen":
     x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
@@ -522,6 +534,7 @@ adj, undirected_edges = build_knn_graph(coords, k=k)
 
 col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
 
+# ---------------- Controls column ----------------
 with col_controls:
     st.subheader("Controls")
 
@@ -573,11 +586,13 @@ with col_controls:
                 else:
                     st.error("No path found. Try increasing connections.")
 
+# ---------------- Map column ----------------
 with col_map:
     st.subheader("Map (click a dot)")
 
     show_edges = st.session_state.get("show_edges", True)
 
+    # Draw only local edges (clean) unless a path exists
     if path and len(path) >= 2:
         edges_to_draw = []
     else:
@@ -603,13 +618,23 @@ with col_map:
     )
 
     if clicked:
-        pi = clicked[0].get("pointIndex")
-        if pi is not None and 0 <= int(pi) < len(df):
-            clicked_genre = df.loc[int(pi), "genre"]
-            st.session_state["pending_genre"] = clicked_genre
-            push_history(clicked_genre)
-            st.rerun()
+        evt = clicked[0]
+        curve = evt.get("curveNumber", None)
 
+        # points trace index = 1 if edges trace exists and is being drawn, otherwise 0
+        points_trace_idx = 1 if (show_edges and len(edges_to_draw) > 0) else 0
+
+        if curve == points_trace_idx:
+            pi = evt.get("pointIndex")
+            if pi is None:
+                pi = evt.get("pointNumber")
+            if pi is not None and 0 <= int(pi) < len(df):
+                clicked_genre = df.loc[int(pi), "genre"]
+                st.session_state["pending_genre"] = clicked_genre
+                push_history(clicked_genre)
+                st.rerun()
+
+# ---------------- Details column ----------------
 with col_details:
     st.subheader("Genre details")
     genre_name = st.session_state.get("selected_genre_dropdown", "")
@@ -637,40 +662,11 @@ with col_details:
         st.caption("Manage app → Settings → Secrets")
     else:
         ex = spotify_example_for_genre(genre_name, market=market)
-
         if ex:
             st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
             st.components.v1.html(spotify_embed_html(ex["type"], ex["id"], height=152), height=170, scrolling=False)
-
-            c1, c2 = st.columns([1, 1])
-            with c1:
-                if st.button("Pin to player", use_container_width=True):
-                    st.session_state["pinned_type"] = ex["type"]
-                    st.session_state["pinned_id"] = ex["id"]
-                    st.session_state["pinned_url"] = ex.get("url")
-                    st.rerun()
-            with c2:
-                if ex.get("url"):
-                    st.markdown(f"[Open in Spotify]({ex['url']})")
+            if ex.get("url"):
+                st.markdown(f"[Open in Spotify]({ex['url']})")
         else:
             st.caption("Couldn’t find a Spotify example for this exact genre name.")
             st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
-
-    st.divider()
-
-    pinned_type = st.session_state.get("pinned_type")
-    pinned_id = st.session_state.get("pinned_id")
-    pinned_url = st.session_state.get("pinned_url")
-
-    st.markdown("### Pinned player")
-    if pinned_type and pinned_id:
-        st.components.v1.html(spotify_embed_html(pinned_type, pinned_id, height=152), height=170, scrolling=False)
-        if pinned_url:
-            st.markdown(f"[Open pinned item in Spotify]({pinned_url})")
-        if st.button("Clear pinned player", use_container_width=True):
-            st.session_state.pop("pinned_type", None)
-            st.session_state.pop("pinned_id", None)
-            st.session_state.pop("pinned_url", None)
-            st.rerun()
-    else:
-        st.caption("Click **Pin to player** on an example to keep it playing while you browse other genres.")
