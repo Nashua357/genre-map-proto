@@ -20,23 +20,52 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
             raise ValueError("No uploaded file provided.")
         df = pd.read_csv(uploaded_bytes)
 
-    required = {"genre", "x", "y", "r", "g", "b"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Missing columns: {missing}")
+    # Require at least these
+    required_base = {"genre", "x", "y"}
+    missing_base = required_base - set(df.columns)
+    if missing_base:
+        raise ValueError(f"Missing columns: {missing_base}. Found: {list(df.columns)}")
 
-    df = df.dropna(subset=["genre", "x", "y", "r", "g", "b"]).copy()
+    df = df.dropna(subset=["genre", "x", "y"]).copy()
     df["genre"] = df["genre"].astype(str)
 
-    for col in ["x", "y", "r", "g", "b"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    df = df.dropna(subset=["x", "y", "r", "g", "b"]).copy()
+    # Make sure x/y are numbers
+    df["x"] = pd.to_numeric(df["x"], errors="coerce")
+    df["y"] = pd.to_numeric(df["y"], errors="coerce")
+    df = df.dropna(subset=["x", "y"]).copy()
 
-    df["r"] = df["r"].clip(0, 255).astype(int)
-    df["g"] = df["g"].clip(0, 255).astype(int)
-    df["b"] = df["b"].clip(0, 255).astype(int)
+    # Color handling: either r/g/b columns OR a hex column like "#aabbcc"
+    if {"r", "g", "b"}.issubset(df.columns):
+        for col in ["r", "g", "b"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df = df.dropna(subset=["r", "g", "b"]).copy()
+        df["r"] = df["r"].clip(0, 255).astype(int)
+        df["g"] = df["g"].clip(0, 255).astype(int)
+        df["b"] = df["b"].clip(0, 255).astype(int)
+
+    else:
+        # try common hex column names
+        hex_col = None
+        for c in ["hex_colour", "hex_color", "hex", "color", "colour"]:
+            if c in df.columns:
+                hex_col = c
+                break
+
+        if hex_col is None:
+            raise ValueError(
+                f"Missing color columns. Need r/g/b or a hex column like hex_colour. Found: {list(df.columns)}"
+            )
+
+        h = df[hex_col].astype(str).str.strip().str.lstrip("#")
+        # Keep only valid 6-char hex
+        h = h.where(h.str.len() == 6, other="000000")
+
+        df["r"] = h.str[0:2].apply(lambda s: int(s, 16))
+        df["g"] = h.str[2:4].apply(lambda s: int(s, 16))
+        df["b"] = h.str[4:6].apply(lambda s: int(s, 16))
 
     return df.reset_index(drop=True)
+
 
 
 @st.cache_data(show_spinner=False)
