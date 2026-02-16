@@ -12,7 +12,9 @@ import requests
 import streamlit as st
 from sklearn.neighbors import NearestNeighbors
 
-# EveryNoise-derived genre attributes (genre,x,y,hex_colour) mirrored in a public repo
+# =========================
+# Settings / URLs
+# =========================
 DATA_URL = "https://raw.githubusercontent.com/AyrtonB/EveryNoise-Watch/main/data/genre_attrs.csv"
 
 WIKI_UA = "genre-map-proto/1.0 (personal project)"
@@ -23,9 +25,9 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 
 
-# ---------------------------
-# Helpers: data loading
-# ---------------------------
+# =========================
+# Data loading
+# =========================
 @st.cache_data(show_spinner=False)
 def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.DataFrame:
     if source == "web":
@@ -70,11 +72,9 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
             df["hex_colour"] = "#888888"
         else:
             h = df[hex_col].astype(str).str.strip()
-            # normalize to "#rrggbb"
             h = h.apply(lambda s: ("#" + s.lstrip("#")) if len(s.lstrip("#")) == 6 else "#888888")
             df["hex_colour"] = h
 
-        # also create r/g/b for compatibility
         hh = df["hex_colour"].str.lstrip("#")
         df["r"] = hh.str[0:2].apply(lambda s: int(s, 16) if len(s) == 2 else 136)
         df["g"] = hh.str[2:4].apply(lambda s: int(s, 16) if len(s) == 2 else 136)
@@ -84,7 +84,7 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
 
 
 @st.cache_data(show_spinner=False)
-def stable_sample_genres(genres: pd.Series, n: int = 400) -> List[str]:
+def stable_sample_genres(genres: pd.Series, n: int = 500) -> List[str]:
     hashes = genres.astype(str).apply(lambda s: zlib.crc32(s.encode("utf-8")))
     picked_idx = hashes.nsmallest(min(n, len(genres))).index
     return genres.loc[picked_idx].sort_values().tolist()
@@ -109,6 +109,7 @@ def build_knn_graph(coords: np.ndarray, k: int):
             adj[v].append((u, d))
             if u < v:
                 edges.append((u, v, d))
+
     return adj, edges
 
 
@@ -143,15 +144,11 @@ def dijkstra_path(adj: List[List[Tuple[int, float]]], start: int, goal: int) -> 
     return path
 
 
-# ---------------------------
-# Helpers: Wikipedia
-# ---------------------------
+# =========================
+# Wikipedia (first paragraph)
+# =========================
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_wikipedia_first_paragraph(genre_name: str) -> Dict[str, Optional[str]]:
-    """
-    Returns {title, paragraph, url} using Wikipedia search -> summary.
-    """
-    # Search for best page
     search_term = f"{genre_name} music genre"
     try:
         r = requests.get(
@@ -175,7 +172,6 @@ def fetch_wikipedia_first_paragraph(genre_name: str) -> Dict[str, Optional[str]]
     except Exception:
         return {"title": None, "paragraph": None, "url": None}
 
-    # Pull summary paragraph
     try:
         r2 = requests.get(
             f"{WIKI_SUMMARY}{quote(title)}",
@@ -184,24 +180,17 @@ def fetch_wikipedia_first_paragraph(genre_name: str) -> Dict[str, Optional[str]]
         )
         r2.raise_for_status()
         js = r2.json()
-
         extract = js.get("extract") or ""
         paragraph = extract.split("\n")[0].strip() if isinstance(extract, str) else None
-
-        url = (
-            js.get("content_urls", {})
-            .get("desktop", {})
-            .get("page")
-        )
-
+        url = js.get("content_urls", {}).get("desktop", {}).get("page")
         return {"title": title, "paragraph": paragraph, "url": url}
     except Exception:
         return {"title": title, "paragraph": None, "url": None}
 
 
-# ---------------------------
-# Helpers: Spotify Web API (Client Credentials)
-# ---------------------------
+# =========================
+# Spotify API (Client Credentials)
+# =========================
 def _get_spotify_creds() -> Tuple[Optional[str], Optional[str]]:
     try:
         return st.secrets.get("SPOTIFY_CLIENT_ID"), st.secrets.get("SPOTIFY_CLIENT_SECRET")
@@ -210,7 +199,6 @@ def _get_spotify_creds() -> Tuple[Optional[str], Optional[str]]:
 
 
 def get_spotify_token() -> Optional[str]:
-    # reuse until near expiry
     now = time.time()
     tok = st.session_state.get("spotify_token")
     exp = st.session_state.get("spotify_token_exp", 0.0)
@@ -242,20 +230,37 @@ def get_spotify_token() -> Optional[str]:
         return None
 
 
-@st.cache_data(show_spinner=False, ttl=60 * 60 * 12)
+def spotify_embed_html(item_type: str, item_id: str) -> str:
+    if item_type not in {"track", "playlist"}:
+        item_type = "track"
+    src = f"https://open.spotify.com/embed/{item_type}/{item_id}"
+    return f"""
+      <iframe style="border-radius:12px"
+        src="{src}"
+        width="100%" height="152" frameborder="0"
+        allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
+        loading="lazy"></iframe>
+    """
+
+
 def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[Dict[str, str]]:
     """
-    Returns one example item to play for a genre.
-    Tries a track using the genre filter; falls back to a playlist search.
-    Dict: {type, id, name, subtitle, url}
+    Returns one example to play for a genre.
+    Uses a small in-memory cache so you don't hammer the API.
+    We do NOT cache failures (None), so it can recover if Spotify had a temporary hiccup.
     """
+    cache = st.session_state.setdefault("spotify_example_cache", {})
+    key = (genre_name, market)
+    if key in cache:
+        return cache[key]
+
     tok = get_spotify_token()
     if not tok:
         return None
 
     headers = {"Authorization": f"Bearer {tok}"}
 
-    # 1) Try track search with genre:"..."
+    # Try track search with genre:"..."
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
@@ -272,26 +277,23 @@ def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[D
         items = r.json().get("tracks", {}).get("items", [])
         if items:
             t = items[0]
-            return {
+            result = {
                 "type": "track",
                 "id": t["id"],
                 "name": t["name"],
                 "subtitle": t["artists"][0]["name"] if t.get("artists") else "",
                 "url": t.get("external_urls", {}).get("spotify", ""),
             }
+            cache[key] = result
+            return result
     except Exception:
         pass
 
-    # 2) Fallback: playlist search by text
+    # Fallback: playlist search
     try:
         r = requests.get(
             SPOTIFY_SEARCH_URL,
-            params={
-                "q": genre_name,
-                "type": "playlist",
-                "limit": 1,
-                "market": market,
-            },
+            params={"q": genre_name, "type": "playlist", "limit": 1, "market": market},
             headers=headers,
             timeout=15,
         )
@@ -299,94 +301,31 @@ def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[D
         items = r.json().get("playlists", {}).get("items", [])
         if items:
             p = items[0]
-            return {
+            result = {
                 "type": "playlist",
                 "id": p["id"],
                 "name": p["name"],
                 "subtitle": "Playlist",
                 "url": p.get("external_urls", {}).get("spotify", ""),
             }
+            cache[key] = result
+            return result
     except Exception:
         pass
 
     return None
 
 
-def spotify_embed_html(item_type: str, item_id: str) -> str:
-    # supports track/playlist embeds
-    if item_type not in {"track", "playlist"}:
-        item_type = "track"
-    src = f"https://open.spotify.com/embed/{item_type}/{item_id}"
-    return f"""
-      <iframe style="border-radius:12px"
-        src="{src}"
-        width="100%" height="152" frameborder="0"
-        allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-        loading="lazy"></iframe>
-    """
-
-
-# ---------------------------
-# Dialog popup
-# ---------------------------
-def _dialog(title: str):
-    if hasattr(st, "dialog"):
-        return st.dialog(title)
-    return st.experimental_dialog(title)
-
-
-@_dialog("Genre details")
-def show_genre_dialog(genre_name: str, market: str):
-    st.subheader(genre_name)
-
-    # Wikipedia paragraph
-    wiki = fetch_wikipedia_first_paragraph(genre_name)
-    if wiki.get("paragraph"):
-        st.write(wiki["paragraph"])
-    else:
-        st.info("No clear Wikipedia summary found for this genre name.")
-
-    if wiki.get("url"):
-        st.markdown(f"[Open Wikipedia article]({wiki['url']})")
-
-    st.divider()
-
-    # Spotify example
-    ex = spotify_example_for_genre(genre_name, market=market)
-    if not ex:
-        st.warning("Couldn’t find a Spotify example for this genre.")
-        st.caption("Some niche genres don’t map cleanly to Spotify’s genre filter/search.")
-        return
-
-    st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
-
-    col1, col2, col3 = st.columns([1, 1, 2])
-    with col1:
-        if st.button("Load into player", use_container_width=True):
-            st.session_state["player_type"] = ex["type"]
-            st.session_state["player_id"] = ex["id"]
-            st.session_state["player_url"] = ex.get("url")
-            st.rerun()
-    with col2:
-        if ex.get("url"):
-            st.markdown(f"[Open in Spotify]({ex['url']})")
-    with col3:
-        st.caption("Tip: press play in the corner player, then close this popup — it keeps playing.")
-
-    # Optional: show a preview embed inside the popup too
-    with st.expander("Preview in this popup"):
-        st.components.v1.html(spotify_embed_html(ex["type"], ex["id"]), height=170, scrolling=False)
-
-
-# ---------------------------
-# Figure
-# ---------------------------
+# =========================
+# Plotly figure
+# =========================
 def make_figure(
     df_plot: pd.DataFrame,
     selected_idx: int,
     neighbor_idxs: Set[int],
     edges_to_draw: List[Tuple[int, int, float]],
     path: Optional[List[int]],
+    click_mode: str,
 ) -> go.Figure:
     n = len(df_plot)
     size = np.full(n, 5.0)
@@ -406,7 +345,6 @@ def make_figure(
 
     fig = go.Figure()
 
-    # edges
     if edges_to_draw:
         xs, ys = [], []
         for u, v, _d in edges_to_draw:
@@ -415,7 +353,8 @@ def make_figure(
 
         fig.add_trace(
             go.Scattergl(
-                x=xs, y=ys,
+                x=xs,
+                y=ys,
                 mode="lines",
                 line=dict(width=1),
                 opacity=0.30,
@@ -424,37 +363,42 @@ def make_figure(
             )
         )
 
-    # points
     fig.add_trace(
         go.Scattergl(
             x=df_plot["x"],
             y=df_plot["y"],
             mode="markers",
             marker=dict(size=size, color=df_plot["hex_colour"], opacity=opacity),
-            customdata=np.arange(n),
-            hovertemplate="<b>%{text}</b><extra></extra>",
+            customdata=np.arange(n),  # stable index for click/selection
             text=df_plot["genre"],
+            hovertemplate="<b>%{text}</b><extra></extra>",
             showlegend=False,
         )
     )
 
+    # Important bits:
+    # - clickmode enables "click a dot selects it"
+    # - dragmode defaults to select or pan depending on user toggle
     fig.update_layout(
         height=720,
         margin=dict(l=10, r=10, t=10, b=10),
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
-        dragmode="pan",
+        clickmode="event+select",
+        dragmode="select" if click_mode == "Select (click dots)" else "pan",
     )
     return fig
 
 
-# ---------------------------
+# =========================
 # App UI
-# ---------------------------
+# =========================
+st.set_page_config(page_title="Phase 1: Genre Map", layout="wide")
+
 st.markdown(
     """
 <style>
-/* pointer cursor for dropdowns */
+/* Pointer cursor for dropdowns */
 div[data-baseweb="select"] * { cursor: pointer !important; }
 div[data-baseweb="select"] input { caret-color: transparent; }
 </style>
@@ -489,6 +433,15 @@ with st.sidebar:
     view_mode = st.radio("Map shape", ["Fit to screen", "Original"], index=0)
 
     st.divider()
+    st.header("Map interaction")
+    click_mode = st.radio(
+        "When you drag on the map:",
+        ["Select (click dots)", "Pan (move around)"],
+        index=0,
+        help="If you want to move the map, switch to Pan. If you want to click dots, use Select.",
+    )
+
+    st.divider()
     st.header("Now Playing")
     player_type = st.session_state.get("player_type")
     player_id = st.session_state.get("player_id")
@@ -504,10 +457,15 @@ with st.sidebar:
             st.session_state.pop("player_url", None)
             st.rerun()
     else:
-        st.caption("Load a genre example to play it here.")
+        st.caption("Pick a genre → the Details panel will offer a 'Load into player' button.")
 
 
-# Main map geometry
+# Keep a selected genre in memory
+if "selected_genre" not in st.session_state:
+    st.session_state["selected_genre"] = df["genre"].iloc[0] if len(df) else ""
+
+
+# Prepare plot coordinates
 df_plot = df.copy()
 if view_mode == "Fit to screen":
     x_min, x_max = df_plot["x"].min(), df_plot["x"].max()
@@ -520,54 +478,47 @@ if view_mode == "Fit to screen":
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
 adj, undirected_edges = build_knn_graph(coords, k=k)
 
-# Single source of truth for selection
-if "selected_genre" not in st.session_state:
-    st.session_state["selected_genre"] = df["genre"].iloc[0] if len(df) else ""
+# Layout: controls | map | details
+col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.2], gap="large")
 
-left, right = st.columns([1, 2], gap="large")
 
-with left:
+# ---------------- Controls column ----------------
+with col_controls:
     st.subheader("Controls")
 
-    # Put dropdowns high so they are more likely to open downward
-    q = st.text_input("Search start genre", value="", key="start_query")
-
+    q = st.text_input("Search genre", value="", key="start_query")
     if q.strip():
         mask = df["genre"].str.contains(q.strip(), case=False, na=False)
         candidates = df.loc[mask, "genre"].tolist()
     else:
-        candidates = df["genre"].head(500).tolist()
+        candidates = df["genre"].head(600).tolist()
 
     if not candidates:
         st.warning("No matches.")
         st.stop()
 
-    # Ensure current selection stays in the list
+    # Keep current selection available even if it doesn't match the search box
     cur = st.session_state["selected_genre"]
     if cur and cur not in candidates and cur in df["genre"].values:
         candidates = [cur] + candidates
 
-    selected = st.selectbox("Selected genre", candidates, index=0, key="selected_genre")
+    chosen = st.selectbox("Selected genre", candidates, index=0, key="selected_genre")
 
-    # Button to open details without clicking the map
-    if st.button("Show details popup"):
-        st.session_state["open_genre_dialog"] = selected
-        st.rerun()
-
-    selected_idx = int(df.index[df["genre"] == selected][0])
+    selected_idx = int(df.index[df["genre"] == chosen][0])
     neighbor_idxs = {v for v, _d in adj[selected_idx]}
     neighbor_list = df.loc[list(neighbor_idxs), "genre"].sort_values().tolist()
 
     st.caption("Closest genres")
     st.write(", ".join(neighbor_list[:25]) + (" ..." if len(neighbor_list) > 25 else ""))
 
+    # Path finder
     path: List[int] = []
     path_edges: List[Tuple[int, int, float]] = []
 
     if show_pathfinder:
         st.markdown("### Path finder")
-
         dest_q = st.text_input("Search destination", value="", key="dest_query")
+
         if dest_q.strip():
             dest_mask = df["genre"].str.contains(dest_q.strip(), case=False, na=False)
             end_candidates = df.loc[dest_mask, "genre"].tolist()
@@ -575,14 +526,13 @@ with left:
             end_candidates = stable_sample_genres(df["genre"], n=500)
 
         if end_candidates:
-            # keep current dest stable
             cur_dest = st.session_state.get("dest_genre")
             if cur_dest and cur_dest not in end_candidates and cur_dest in df["genre"].values:
                 end_candidates = [cur_dest] + end_candidates
 
             end = st.selectbox("Destination genre", end_candidates, index=0, key="dest_genre")
 
-            # Spacer encourages dropdown to open downward
+            # spacer encourages dropdown to open downward
             st.markdown('<div style="height: 120px;"></div>', unsafe_allow_html=True)
 
             if st.button("Find shortest path"):
@@ -597,10 +547,11 @@ with left:
                     st.error("No path found. Try increasing connections.")
 
 
-with right:
-    st.subheader("Map (click a genre dot for details)")
+# ---------------- Map column ----------------
+with col_map:
+    st.subheader("Map")
 
-    # edges to draw: focused neighborhood unless a path exists
+    # edges to draw: focused neighborhood unless path exists
     if path_edges:
         edges_to_draw = path_edges
     else:
@@ -613,9 +564,11 @@ with right:
         neighbor_idxs=neighbor_idxs,
         edges_to_draw=edges_to_draw,
         path=path if path else None,
+        click_mode=click_mode,
     )
 
-    # Click handling
+    st.caption("Tip: If clicking dots does nothing, switch 'Map interaction' to **Select (click dots)** in the sidebar.")
+
     evt = st.plotly_chart(
         fig,
         use_container_width=True,
@@ -625,35 +578,71 @@ with right:
         key="genre_map",
     )
 
-    # Read clicked point
+    # Extract selection (works when a dot is selected)
     clicked_genre = None
     try:
         if evt and getattr(evt, "selection", None):
             sel = evt.selection
             points = sel.get("points", []) if isinstance(sel, dict) else []
             if points:
-                p0 = points[0]
-                idx = p0.get("point_index")
+                idx = points[0].get("point_index")
                 if idx is not None and 0 <= int(idx) < len(df):
                     clicked_genre = df.loc[int(idx), "genre"]
     except Exception:
         clicked_genre = None
 
-    # If user clicked a different genre, update selection and open popup
     if clicked_genre:
-        last = st.session_state.get("last_clicked_genre")
-        if clicked_genre != last:
-            st.session_state["last_clicked_genre"] = clicked_genre
-            st.session_state["selected_genre"] = clicked_genre
-            st.session_state["open_genre_dialog"] = clicked_genre
-            st.rerun()
+        st.session_state["selected_genre"] = clicked_genre  # updates Details panel immediately
 
 
-# Open dialog if requested
-to_open = st.session_state.pop("open_genre_dialog", None)
-if to_open:
-    show_genre_dialog(to_open, market=market)
+# ---------------- Details column ----------------
+with col_details:
+    st.subheader("Genre details")
+    genre_name = st.session_state.get("selected_genre", "")
 
-st.caption(
-    "Tip: play something in the Now Playing corner, then close the popup — it keeps playing."
-)
+    if not genre_name:
+        st.info("Select a genre to see details.")
+    else:
+        st.markdown(f"**{genre_name}**")
+
+        # Wikipedia paragraph + link
+        wiki = fetch_wikipedia_first_paragraph(genre_name)
+        if wiki.get("paragraph"):
+            st.write(wiki["paragraph"])
+        else:
+            st.caption("No clear Wikipedia summary found for this genre name.")
+
+        if wiki.get("url"):
+            st.markdown(f"[Open Wikipedia article]({wiki['url']})")
+
+        st.divider()
+
+        # Spotify example + controls
+        client_id, client_secret = _get_spotify_creds()
+        if not client_id or not client_secret:
+            st.warning("Spotify keys not found in Streamlit Secrets.")
+            st.caption("Check Manage app → Settings → Secrets.")
+        else:
+            ex = spotify_example_for_genre(genre_name, market=market)
+
+            if ex:
+                st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
+                c1, c2 = st.columns([1, 1])
+                with c1:
+                    if st.button("Load into player", use_container_width=True):
+                        st.session_state["player_type"] = ex["type"]
+                        st.session_state["player_id"] = ex["id"]
+                        st.session_state["player_url"] = ex.get("url")
+                        st.rerun()
+                with c2:
+                    if ex.get("url"):
+                        st.markdown(f"[Open in Spotify]({ex['url']})")
+
+                with st.expander("Preview here"):
+                    st.components.v1.html(spotify_embed_html(ex["type"], ex["id"]), height=170, scrolling=False)
+            else:
+                st.caption("Couldn’t find a Spotify example for this exact genre name.")
+                st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
+
+
+st.caption("Now Playing stays in the sidebar. Once you load an example, it can be paused/played anytime.")
