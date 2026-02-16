@@ -3,6 +3,7 @@ import heapq
 import html
 import re
 import time
+import uuid
 import zlib
 from typing import Optional, List, Tuple, Dict, Set
 from urllib.parse import quote
@@ -18,7 +19,6 @@ from sklearn.neighbors import NearestNeighbors
 # URLs
 # =========================
 DATA_URL = "https://raw.githubusercontent.com/AyrtonB/EveryNoise-Watch/main/data/genre_attrs.csv"
-
 WIKI_API = "https://en.wikipedia.org/w/api.php"
 WIKI_UA = "genre-map-proto/1.0 (personal project)"
 
@@ -28,12 +28,24 @@ SPOTIFY_SEARCH_URL = "https://api.spotify.com/v1/search"
 HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 NONE_OPTION = "— none —"
 
-# background used for blending (keeps “faint” dots crisp without blur)
+# Used for “faint” dot colors (we blend colors instead of using opacity so dots stay crisp)
 BG_HEX = "#0b0f17"
+
+# Wikipedia scoring helpers
+MUSIC_TERMS = {
+    "music", "musical", "genre", "style", "band", "song", "album",
+    "rock", "jazz", "blues", "hip hop", "hip-hop", "electronic", "dance",
+    "folk", "punk", "metal", "pop", "rap", "reggae", "soul", "funk", "country",
+    "classical", "orchestra", "composer", "singer", "guitar", "drum", "rhythm",
+}
+PLACE_TERMS = {
+    "city", "town", "county", "province", "state", "capital", "municipality",
+    "river", "lake", "mountain", "is the largest", "is a city", "is a town",
+}
 
 
 # =========================
-# Helpers
+# Small helpers
 # =========================
 def safe_hex(s: str) -> str:
     if s is None:
@@ -105,6 +117,7 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
     df["y"] = pd.to_numeric(df["y"], errors="coerce")
     df = df.dropna(subset=["x", "y"]).copy()
 
+    # Colors: either r,g,b or a hex column
     if {"r", "g", "b"}.issubset(df.columns):
         for c in ["r", "g", "b"]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -123,10 +136,7 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
             if c in df.columns:
                 hex_col = c
                 break
-        if hex_col is None:
-            df["hex_colour"] = "#888888"
-        else:
-            df["hex_colour"] = df[hex_col]
+        df["hex_colour"] = df[hex_col] if hex_col else "#888888"
 
     df["hex_colour"] = df["hex_colour"].apply(safe_hex)
     return df.reset_index(drop=True)
@@ -134,10 +144,6 @@ def load_genre_data(source: str, uploaded_bytes: Optional[bytes] = None) -> pd.D
 
 @st.cache_data(show_spinner=False)
 def stable_label_sample(genres: pd.Series, n: int = 140) -> List[int]:
-    """
-    Pick a stable subset of label indices so the map isn’t unreadable.
-    Stable = based on hash so it doesn’t change between reruns.
-    """
     hashes = genres.astype(str).apply(lambda s: zlib.crc32(s.encode("utf-8")))
     picked = hashes.nsmallest(min(n, len(genres))).index.tolist()
     return picked
@@ -197,7 +203,7 @@ def dijkstra_path(adj: List[List[Tuple[int, float]]], start: int, goal: int) -> 
 
 
 # =========================
-# Wikipedia (lead + links)
+# Wikipedia (better matching)
 # =========================
 def _fetch_page_intro_by_title(title: str) -> Dict[str, Optional[str]]:
     headers = {"User-Agent": WIKI_UA}
@@ -252,7 +258,6 @@ def _fetch_lead_html(title: str) -> Optional[str]:
 def _extract_first_paragraph_links(lead_html: str) -> List[str]:
     if not lead_html:
         return []
-
     ps = re.findall(r"<p>(.*?)</p>", lead_html, flags=re.DOTALL | re.IGNORECASE)
     first_p = None
     for p in ps:
@@ -284,6 +289,19 @@ def _extract_first_paragraph_links(lead_html: str) -> List[str]:
     return out
 
 
+def _looks_like_music(paragraph: str) -> bool:
+    if not paragraph:
+        return False
+    p = paragraph.lower()
+    # Must contain at least one music-ish hint
+    if not any(t in p for t in MUSIC_TERMS):
+        return False
+    # Strong penalty for “place” pages unless they also very clearly talk about music
+    if any(t in p for t in PLACE_TERMS) and "music" not in p and "musical" not in p:
+        return False
+    return True
+
+
 @st.cache_data(show_spinner=False, ttl=60 * 60 * 24)
 def fetch_wikipedia_lead(genre_name: str) -> Dict[str, object]:
     headers = {"User-Agent": WIKI_UA}
@@ -300,78 +318,108 @@ def fetch_wikipedia_lead(genre_name: str) -> Dict[str, object]:
         "outline of music",
     }
 
-    best = {"title": None, "paragraph": None, "url": None}
+    def title_score(t: str) -> int:
+        ng = norm_title(g)
+        nt = norm_title(t)
+        if not nt or nt in banned_titles:
+            return -9999
 
+        score = 0
+        if nt == ng:
+            score += 120
+        if ng and ng in nt:
+            score += 80
+
+        # Prefer pages that explicitly say music/genre in the title
+        if "music" in nt:
+            score += 35
+        if "genre" in nt:
+            score += 25
+        if "style" in nt:
+            score += 15
+
+        # Small boost if all words appear
+        toks = ng.split()
+        if toks and all(tok in nt for tok in toks):
+            score += 30
+
+        return score
+
+    best = {"title": None, "paragraph": None, "url": None}
+    best_score = -9999
+
+    # Try direct title first
     try:
         direct = _fetch_page_intro_by_title(g)
-        if direct.get("title") and norm_title(direct["title"]) not in banned_titles and direct.get("paragraph"):
-            best = direct
+        if direct.get("title") and norm_title(direct["title"]) not in banned_titles:
+            if direct.get("paragraph") and _looks_like_music(direct["paragraph"]):
+                best = direct
+                best_score = 999
     except Exception:
         pass
 
-    if not best.get("title"):
-        candidates: List[str] = []
-        queries = [
-            f'intitle:"{g}"',
-            f'"{g}"',
-            f"{g} music",
-            f"{g} genre",
-        ]
-        for q in queries:
-            try:
-                r = requests.get(
-                    WIKI_API,
-                    params={"action": "query", "list": "search", "srsearch": q, "srlimit": 5, "format": "json"},
-                    headers=headers,
-                    timeout=15,
-                )
-                r.raise_for_status()
-                hits = r.json().get("query", {}).get("search", [])
-                for h in hits:
-                    t = h.get("title")
-                    if t:
-                        candidates.append(t)
-            except Exception:
+    # Search queries (music-weighted)
+    queries = [
+        f'intitle:"{g}" (music OR genre OR style)',
+        f'"{g}" (music OR genre OR style)',
+        f'{g} music genre',
+        f'{g} musical style',
+    ]
+
+    candidates: List[str] = []
+    for q in queries:
+        try:
+            r = requests.get(
+                WIKI_API,
+                params={"action": "query", "list": "search", "srsearch": q, "srlimit": 8, "format": "json"},
+                headers=headers,
+                timeout=15,
+            )
+            r.raise_for_status()
+            hits = r.json().get("query", {}).get("search", [])
+            for h in hits:
+                t = h.get("title")
+                if t:
+                    candidates.append(t)
+        except Exception:
+            continue
+
+    # Dedup
+    seen = set()
+    cand_titles = []
+    for t in candidates:
+        if t not in seen:
+            seen.add(t)
+            cand_titles.append(t)
+
+    # Evaluate candidates by pulling their intro and scoring
+    for t in cand_titles[:20]:
+        try:
+            page = _fetch_page_intro_by_title(t)
+            para = page.get("paragraph")
+            if not para:
+                continue
+            if norm_title(page.get("title") or "") in banned_titles:
+                continue
+            if not _looks_like_music(para):
                 continue
 
-        seen = set()
-        cand_titles = []
-        for t in candidates:
-            if t not in seen:
-                seen.add(t)
-                cand_titles.append(t)
+            s = title_score(page.get("title") or t)
 
-        ng = norm_title(g)
+            # Bonus if paragraph explicitly mentions “genre” or “style”
+            pl = para.lower()
+            if "genre" in pl:
+                s += 20
+            if "musical style" in pl or "style of" in pl:
+                s += 15
 
-        def score_title(t: str) -> int:
-            nt = norm_title(t)
-            if nt in banned_titles:
-                return -9999
-            if nt == ng:
-                return 100
-            if ng and ng in nt:
-                return 80
-            toks = ng.split()
-            if toks and all(tok in nt for tok in toks):
-                return 60
-            return 10
-
-        best_score = -9999
-        for t in cand_titles[:12]:
-            s = score_title(t)
-            if s <= best_score:
-                continue
-            try:
-                page = _fetch_page_intro_by_title(t)
-                if not page.get("paragraph"):
-                    continue
-                if norm_title(page.get("title") or "") in banned_titles:
-                    continue
+            if s > best_score:
                 best = page
                 best_score = s
-            except Exception:
-                continue
+        except Exception:
+            continue
 
+    # Extract lead paragraph links for picking an artist example
     lead_links: List[str] = []
     if best.get("title"):
         try:
@@ -497,66 +545,6 @@ def spotify_artist_from_wikipedia_links(link_names: List[str], market: str = "AU
     return None
 
 
-def spotify_example_for_genre(genre_name: str, market: str = "AU") -> Optional[Dict[str, str]]:
-    cache = st.session_state.setdefault("spotify_example_cache", {})
-    key = ("genre_example", genre_name, market)
-    if key in cache:
-        return cache[key]
-
-    tok = get_spotify_token()
-    if not tok:
-        return None
-    headers = {"Authorization": f"Bearer {tok}"}
-
-    try:
-        r = requests.get(
-            SPOTIFY_SEARCH_URL,
-            params={"q": f'genre:"{genre_name}"', "type": "track", "limit": 1, "market": market},
-            headers=headers,
-            timeout=15,
-        )
-        r.raise_for_status()
-        items = r.json().get("tracks", {}).get("items", [])
-        if items:
-            t = items[0]
-            result = {
-                "type": "track",
-                "id": t["id"],
-                "name": t["name"],
-                "subtitle": t["artists"][0]["name"] if t.get("artists") else "",
-                "url": t.get("external_urls", {}).get("spotify", ""),
-            }
-            cache[key] = result
-            return result
-    except Exception:
-        pass
-
-    try:
-        r = requests.get(
-            SPOTIFY_SEARCH_URL,
-            params={"q": genre_name, "type": "playlist", "limit": 1, "market": market},
-            headers=headers,
-            timeout=15,
-        )
-        r.raise_for_status()
-        items = r.json().get("playlists", {}).get("items", [])
-        if items:
-            p = items[0]
-            result = {
-                "type": "playlist",
-                "id": p["id"],
-                "name": p["name"],
-                "subtitle": "Playlist",
-                "url": p.get("external_urls", {}).get("spotify", ""),
-            }
-            cache[key] = result
-            return result
-    except Exception:
-        pass
-
-    return None
-
-
 def spotify_embed_html(item_type: str, item_id: str, height: int = 152) -> str:
     if item_type not in {"track", "playlist", "artist"}:
         item_type = "track"
@@ -571,7 +559,7 @@ def spotify_embed_html(item_type: str, item_id: str, height: int = 152) -> str:
 
 
 # =========================
-# Selection history
+# History
 # =========================
 def push_history(genre: str, max_len: int = 20):
     if not genre or genre == NONE_OPTION:
@@ -622,7 +610,8 @@ def make_figure(
     neighbor_label_count: int,
     default_label_idxs: List[int],
     label_size: int,
-    axis_ranges: Tuple[Tuple[float, float], Tuple[float, float]],
+    view_override: Optional[Tuple[Tuple[float, float], Tuple[float, float]]],
+    uirev: str,
 ) -> go.Figure:
     n = len(df_plot)
     X = df_plot["x"].astype(float).to_numpy()
@@ -636,23 +625,20 @@ def make_figure(
     has_selection = selected_idx is not None
     has_path = len(path) >= 2
 
-    # base edges
-    edges_x, edges_y = build_edges_xy(X, Y, edges_all)
-
-    # base colors (crisp “faint” via blended colors, not opacity)
+    # Base colors
     if not has_selection:
         base_colors = C
     else:
         base_colors = CF_PATH if has_path else CF_SEL
 
-    # highlight nodes
+    # Highlight nodes
     hi_idx: List[int] = []
     if has_selection and not has_path:
         hi_idx = sorted(set(list(neighbor_idxs) + [selected_idx]))
     elif has_selection and has_path:
         hi_idx = sorted(set([i for i in path if 0 <= i < n]))
 
-    # highlight lines
+    # Highlight lines
     hi_lx, hi_ly = [], []
     if has_selection and show_edges:
         if has_path:
@@ -660,7 +646,10 @@ def make_figure(
         else:
             hi_lx, hi_ly = build_star_xy(X, Y, selected_idx, adj)
 
-    # labels
+    # All edges
+    edges_x, edges_y = build_edges_xy(X, Y, edges_all)
+
+    # Labels
     label_x, label_y, label_t = [], [], []
     if show_labels:
         if not has_selection:
@@ -674,26 +663,26 @@ def make_figure(
                     label_idxs.append(path[-1])
             else:
                 label_idxs.append(selected_idx)
-                if neighbor_label_count > 0:
-                    for i in sorted(list(neighbor_idxs))[:neighbor_label_count]:
-                        label_idxs.append(i)
+                for i in sorted(list(neighbor_idxs))[:neighbor_label_count]:
+                    label_idxs.append(i)
             label_idxs = sorted(set([i for i in label_idxs if 0 <= i < n]))
 
         label_x = [float(X[i]) for i in label_idxs]
         label_y = [float(Y[i]) for i in label_idxs]
         label_t = [str(G[i]) for i in label_idxs]
 
-    (xmin, xmax), (ymin, ymax) = axis_ranges
-
     fig = go.Figure()
 
-    # 0) global edges (always present; fade when selected)
+    # Edges (WebGL for smoothness)
     fig.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=edges_x,
             y=edges_y,
             mode="lines",
-            line=dict(width=1.1, color="rgba(150,180,255,0.34)" if not has_selection else "rgba(150,180,255,0.10)"),
+            line=dict(
+                width=1.1,
+                color="rgba(150,180,255,0.34)" if not has_selection else "rgba(150,180,255,0.10)",
+            ),
             hoverinfo="skip",
             showlegend=False,
             uid="edges_all",
@@ -701,9 +690,9 @@ def make_figure(
         )
     )
 
-    # 1) base points (always present)
+    # Base points (WebGL)
     fig.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=X,
             y=Y,
             mode="markers",
@@ -716,10 +705,9 @@ def make_figure(
         )
     )
 
-    # 2) big invisible click targets (must be “selectable”)
-    # NOTE: This is deliberately tiny-visible to Plotly but still invisible to humans.
+    # Click targets (WebGL)
     fig.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=X,
             y=Y,
             mode="markers",
@@ -732,9 +720,9 @@ def make_figure(
         )
     )
 
-    # 3) highlight line(s)
+    # Highlight lines
     fig.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=hi_lx,
             y=hi_ly,
             mode="lines",
@@ -745,10 +733,10 @@ def make_figure(
         )
     )
 
-    # 4) highlight points
+    # Highlight points
     if hi_idx:
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=X[hi_idx],
                 y=Y[hi_idx],
                 mode="markers",
@@ -761,18 +749,9 @@ def make_figure(
             )
         )
     else:
-        fig.add_trace(
-            go.Scatter(
-                x=[],
-                y=[],
-                mode="markers",
-                marker=dict(size=13),
-                showlegend=False,
-                uid="points_highlight",
-            )
-        )
+        fig.add_trace(go.Scattergl(x=[], y=[], mode="markers", showlegend=False, uid="points_highlight"))
 
-    # 5) labels
+    # Labels (regular Scatter works better for text than WebGL)
     fig.add_trace(
         go.Scatter(
             x=label_x,
@@ -787,22 +766,42 @@ def make_figure(
         )
     )
 
+    xaxis = dict(visible=False)
+    yaxis = dict(visible=False)
+    if view_override is not None:
+        (xmin, xmax), (ymin, ymax) = view_override
+        xaxis.update(range=[xmin, xmax])
+        yaxis.update(range=[ymin, ymax])
+
     fig.update_layout(
         template="plotly_dark",
         height=720,
         margin=dict(l=10, r=10, t=10, b=10),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
-        xaxis=dict(visible=False, range=[xmin, xmax]),
-        yaxis=dict(visible=False, range=[ymin, ymax]),
+        xaxis=xaxis,
+        yaxis=yaxis,
         dragmode="pan",
-        # IMPORTANT: click selects a point
         clickmode="event+select",
         hovermode="closest",
-        # IMPORTANT: keep view between reruns
-        uirevision="keep-view",
+        # This is what prevents “resetting” when the app reruns
+        uirevision=uirev,
     )
     return fig
+
+
+def compute_zoom_box(df_plot: pd.DataFrame, idxs: List[int], pad_frac: float = 0.20):
+    xs = df_plot.loc[idxs, "x"].astype(float).to_numpy()
+    ys = df_plot.loc[idxs, "y"].astype(float).to_numpy()
+    xmin, xmax = float(xs.min()), float(xs.max())
+    ymin, ymax = float(ys.min()), float(ys.max())
+    dx = (xmax - xmin) or 1.0
+    dy = (ymax - ymin) or 1.0
+    xmin -= dx * pad_frac
+    xmax += dx * pad_frac
+    ymin -= dy * pad_frac
+    ymax += dy * pad_frac
+    return (xmin, xmax), (ymin, ymax)
 
 
 # =========================
@@ -823,6 +822,10 @@ div[data-baseweb="select"] input { caret-color: transparent; }
 
 st.title("Phase 1 Prototype — Genre Map")
 
+# Stable “don’t reset the view” ID for this session
+if "ui_rev" not in st.session_state:
+    st.session_state["ui_rev"] = str(uuid.uuid4())
+
 # Defaults
 if "selected_genre_dropdown" not in st.session_state:
     st.session_state["selected_genre_dropdown"] = NONE_OPTION
@@ -830,6 +833,8 @@ if "current_path" not in st.session_state:
     st.session_state["current_path"] = []
 if "path_message" not in st.session_state:
     st.session_state["path_message"] = ""
+if "view_override" not in st.session_state:
+    st.session_state["view_override"] = None  # only used when pressing Zoom/Reset buttons
 
 # Apply pending click selection BEFORE widgets are created
 pending = st.session_state.pop("pending_genre", None)
@@ -906,23 +911,17 @@ if view_mode == "Fit to screen":
     if y_max != y_min:
         df_plot["y"] = (df_plot["y"] - y_min) / (y_max - y_min)
 
-# crisp faint colors
-df_plot["hex_faint_sel"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.28))
-df_plot["hex_faint_path"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.18))
+# Faint colors (crisp)
+# NOTE: A bit less faint than before to avoid “blur/washed out” feeling.
+df_plot["hex_faint_sel"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.38))
+df_plot["hex_faint_path"] = df_plot["hex_colour"].apply(lambda c: blend_hex(c, BG_HEX, 0.26))
 
 coords = df_plot[["x", "y"]].to_numpy(dtype=float)
 adj, undirected_edges = build_knn_graph(coords, k=k)
 
-# fixed axis ranges (prevents dropdown selection “reset”)
-xmin, xmax = float(df_plot["x"].min()), float(df_plot["x"].max())
-ymin, ymax = float(df_plot["y"].min()), float(df_plot["y"].max())
-pad_x = (xmax - xmin) * 0.05 if xmax > xmin else 1.0
-pad_y = (ymax - ymin) * 0.05 if ymax > ymin else 1.0
-axis_ranges = ((xmin - pad_x, xmax + pad_x), (ymin - pad_y, ymax + pad_y))
-
 default_label_idxs = stable_label_sample(df_plot["genre"], n=140)
 
-col_controls, col_map, col_details = st.columns([1.1, 2.2, 1.3], gap="large")
+col_controls, col_map, col_details = st.columns([1.15, 2.2, 1.35], gap="large")
 
 # ---------------- Controls column ----------------
 with col_controls:
@@ -961,6 +960,21 @@ with col_controls:
         neighbor_idxs = set()
         st.caption("Closest genres")
         st.write("Select a genre to show its nearest neighbors.")
+
+    st.markdown("### Zoom (faster than scroll wheel)")
+    zc1, zc2 = st.columns(2)
+    with zc1:
+        if st.button("Zoom to selected", use_container_width=True, disabled=(chosen == NONE_OPTION)):
+            idxs = [selected_idx] + sorted(list(neighbor_idxs))[:min(20, len(neighbor_idxs))]
+            st.session_state["view_override"] = compute_zoom_box(df_plot, idxs, pad_frac=0.28)
+            # Changing uirevision forces Plotly to adopt the new range
+            st.session_state["ui_rev"] = str(uuid.uuid4())
+            st.rerun()
+    with zc2:
+        if st.button("Reset view", use_container_width=True):
+            st.session_state["view_override"] = None
+            st.session_state["ui_rev"] = str(uuid.uuid4())
+            st.rerun()
 
     if st.session_state.get("enable_path", True):
         st.markdown("### Path finder")
@@ -1008,7 +1022,8 @@ with col_map:
         neighbor_label_count=neighbor_label_count,
         default_label_idxs=default_label_idxs,
         label_size=label_size,
-        axis_ranges=axis_ranges,
+        view_override=st.session_state.get("view_override"),
+        uirev=st.session_state["ui_rev"],
     )
 
     event = st.plotly_chart(
@@ -1019,7 +1034,6 @@ with col_map:
         config={"scrollZoom": True, "doubleClick": "reset", "displaylogo": False, "responsive": True},
     )
 
-    # Streamlit gives us selection events. A click should create a 1-point selection.
     sel = getattr(event, "selection", None)
     if sel is None and isinstance(event, dict):
         sel = event.get("selection")
@@ -1029,9 +1043,7 @@ with col_map:
         points = getattr(sel, "points", None)
         if points is None and isinstance(sel, dict):
             points = sel.get("points")
-
         if points:
-            # Find the first point with customdata (our index)
             for p in points:
                 cd = p.get("customdata")
                 if cd is not None:
@@ -1060,7 +1072,7 @@ with col_details:
         if wiki.get("paragraph"):
             st.write(wiki["paragraph"])
         else:
-            st.caption("No clear Wikipedia summary found for this genre name.")
+            st.caption("No clear music-related Wikipedia summary found for this genre name.")
 
         if wiki.get("url"):
             st.markdown(f"[Open Wikipedia article]({wiki['url']})")
@@ -1070,7 +1082,6 @@ with col_details:
         client_id, client_secret = _get_spotify_creds()
         if not client_id or not client_secret:
             st.warning("Spotify keys not found in Streamlit Secrets.")
-            st.caption("Manage app → Settings → Secrets")
         else:
             artist = spotify_artist_from_wikipedia_links(wiki.get("lead_link_names", []), market=market)
             if artist:
@@ -1079,12 +1090,5 @@ with col_details:
                 if artist.get("url"):
                     st.markdown(f"[Open in Spotify]({artist['url']})")
             else:
-                ex = spotify_example_for_genre(genre_name, market=market)
-                if ex:
-                    st.markdown(f"**Example:** {ex['name']} — {ex['subtitle']}")
-                    st.components.v1.html(spotify_embed_html(ex["type"], ex["id"], height=152), height=170, scrolling=False)
-                    if ex.get("url"):
-                        st.markdown(f"[Open in Spotify]({ex['url']})")
-                else:
-                    st.caption("Couldn’t find a Spotify example for this genre name.")
-                    st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
+                st.caption("No clear artist found in the first paragraph links. (Some Wikipedia pages don’t name artists early.)")
+                st.markdown(f"[Search this in Spotify](https://open.spotify.com/search/{quote(genre_name)})")
