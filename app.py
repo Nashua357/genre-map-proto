@@ -10,13 +10,6 @@ import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-# Optional (but recommended) for reliable Plotly click events in Streamlit
-try:
-    from streamlit_plotly_events import plotly_events  # provided by streamlit-plotly-events
-    HAS_PLOTLY_EVENTS = True
-except Exception:
-    HAS_PLOTLY_EVENTS = False
-
 
 # ----------------------------
 # Page + global style
@@ -143,19 +136,16 @@ def load_genre_data_from_repo() -> pd.DataFrame:
     df = pd.read_csv(path)
     colmap = {c.lower(): c for c in df.columns}
 
-    def pick(name: str) -> Optional[str]:
-        return colmap.get(name)
-
-    genre_col = pick("genre") or pick("name")
-    x_col = pick("x")
-    y_col = pick("y")
+    genre_col = colmap.get("genre") or colmap.get("name")
+    x_col = colmap.get("x")
+    y_col = colmap.get("y")
 
     if not genre_col or not x_col or not y_col:
         raise ValueError("CSV must contain at least: genre, x, y columns.")
 
     df = df.rename(columns={genre_col: "genre", x_col: "x", y_col: "y"})
 
-    r_col, g_col, b_col = pick("r"), pick("g"), pick("b")
+    r_col, g_col, b_col = colmap.get("r"), colmap.get("g"), colmap.get("b")
     if r_col and g_col and b_col:
         df = df.rename(columns={r_col: "r", g_col: "g", b_col: "b"})
     else:
@@ -169,7 +159,6 @@ def load_genre_data_from_repo() -> pd.DataFrame:
 
     df = df.dropna(subset=["x", "y"]).reset_index(drop=True)
     df["genre"] = df["genre"].astype(str)
-
     df["hex"] = df.apply(lambda row: f"rgb({int(row.r)},{int(row.g)},{int(row.b)})", axis=1)
     return df
 
@@ -200,7 +189,6 @@ def load_genre_data_from_upload(uploaded_file) -> pd.DataFrame:
 
     df = df.dropna(subset=["x", "y"]).reset_index(drop=True)
     df["genre"] = df["genre"].astype(str)
-
     df["hex"] = df.apply(lambda row: f"rgb({int(row.r)},{int(row.g)},{int(row.b)})", axis=1)
     return df
 
@@ -461,7 +449,10 @@ with st.sidebar:
         if cols[0].button("Clear", use_container_width=True):
             st.session_state.selection_history = []
             st.rerun()
-        cols[1].markdown(f"<div class='small-muted'>{len(st.session_state.selection_history)} saved</div>", unsafe_allow_html=True)
+        cols[1].markdown(
+            f"<div class='small-muted'>{len(st.session_state.selection_history)} saved</div>",
+            unsafe_allow_html=True,
+        )
     else:
         st.markdown("<div class='small-muted'>No history yet.</div>", unsafe_allow_html=True)
 
@@ -564,7 +555,6 @@ with col_left:
     if cur != "(none)" and cur not in options and cur in genres:
         options = ["(none)", cur] + filtered
 
-    # Key fix: dropdown key == session state key that clicks update
     st.selectbox("Selected genre", options, key="selected_genre")
 
     selected_genre = "" if st.session_state.selected_genre == "(none)" else st.session_state.selected_genre
@@ -645,9 +635,13 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
                     ys += [df.at[i, "y"], df.at[j, "y"], None]
             line_traces.append(
                 go.Scatter(
-                    x=xs, y=ys, mode="lines",
-                    line=dict(width=1, color=f"rgba(220,220,220,{0.22 * ls})"),
-                    hoverinfo="skip", name="edges", showlegend=False
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    line=dict(width=1, color=f"rgba(220,220,220,{0.18 + 0.18*ls})"),
+                    hoverinfo="skip",
+                    name="edges",
+                    showlegend=False,
                 )
             )
         else:
@@ -660,9 +654,13 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
                         ys += [df.at[i, "y"], df.at[j, "y"], None]
             line_traces.append(
                 go.Scatter(
-                    x=xs, y=ys, mode="lines",
-                    line=dict(width=2, color=f"rgba(255,255,255,{0.55 * ls})"),
-                    hoverinfo="skip", name="edges_focus", showlegend=False
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    line=dict(width=2, color=f"rgba(255,255,255,{0.25 + 0.45*ls})"),
+                    hoverinfo="skip",
+                    name="edges_focus",
+                    showlegend=False,
                 )
             )
 
@@ -674,19 +672,25 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
             ys += [df.at[a, "y"], df.at[b, "y"], None]
         line_traces.append(
             go.Scatter(
-                x=xs, y=ys, mode="lines",
+                x=xs,
+                y=ys,
+                mode="lines",
                 line=dict(width=4, color="rgba(255,255,255,0.95)"),
-                hoverinfo="skip", name="path", showlegend=False
+                hoverinfo="skip",
+                name="path",
+                showlegend=False,
             )
         )
 
-    marker_trace = go.Scattergl(
-        x=df["x"], y=df["y"],
+    marker_trace = go.Scatter(
+        x=df["x"],
+        y=df["y"],
         mode="markers",
         marker=dict(size=sizes, color=rgba, line=dict(width=0)),
         text=df["genre"],
         hovertemplate="%{text}<extra></extra>",
-        name="markers", showlegend=False,
+        name="markers",
+        showlegend=False,
     )
 
     label_indices = label_idxs_default
@@ -719,10 +723,10 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
         dragmode="pan",
         hovermode="closest",
         clickmode="event+select",
-        uirevision=f"map-v3-{map_fit}-{st.session_state.reset_view_tick}",
+        # uirevision keeps your zoom/pan instead of "resetting" on rerun
+        uirevision=f"map-v4-{map_fit}-{st.session_state.reset_view_tick}",
     )
 
-    # Only set ranges on reset/first load (prevents “map resets when selecting a genre”)
     if st.session_state.applied_reset_tick != st.session_state.reset_view_tick:
         fig.update_xaxes(visible=False, range=default_xrange)
         fig.update_yaxes(visible=False, range=default_yrange)
@@ -737,7 +741,7 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
     return fig, label_indices
 
 
-def clicked_genre_from_event(fig: go.Figure, label_indices: np.ndarray, curve: int, pidx: int) -> Optional[str]:
+def clicked_genre_from_selection(fig: go.Figure, label_indices: np.ndarray, curve: int, pidx: int) -> Optional[str]:
     if curve < 0 or curve >= len(fig.data):
         return None
     tr = fig.data[curve]
@@ -765,57 +769,40 @@ with col_mid:
         "scrollZoom": True,
         "displaylogo": False,
         "responsive": True,
-        "plotGlPixelRatio": 2,
         "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d", "resetScale2d"],
     }
 
     clicked_genre: Optional[str] = None
 
-    if HAS_PLOTLY_EVENTS:
-        events = plotly_events(
-            fig,
-            click_event=True,
-            select_event=False,
-            hover_event=False,
-            override_height=650,
-            config=config,
-            key=PLOT_KEY,
-        )
-        if events:
-            ev0 = events[0]
-            curve = ev0.get("curveNumber")
-            pidx = ev0.get("pointIndex")
-            if pidx is None:
-                pidx = ev0.get("pointNumber")
-            try:
-                clicked_genre = clicked_genre_from_event(fig, label_indices, int(curve), int(pidx))
-            except Exception:
-                clicked_genre = None
-    else:
-        event = st.plotly_chart(
-            fig,
-            use_container_width=True,
-            config=config,
-            on_select="rerun",
-            selection_mode=["points"],
-            key=PLOT_KEY,
-        )
-        try:
-            pts = event.selection.points  # type: ignore[attr-defined]
-            if pts and isinstance(pts, list):
-                p0 = pts[0]
-                curve = p0.get("curve_number")
-                pidx = p0.get("point_index")
-                if curve is not None and pidx is not None:
-                    clicked_genre = clicked_genre_from_event(fig, label_indices, int(curve), int(pidx))
-        except Exception:
-            clicked_genre = None
+    # Native Streamlit click/selection support (no streamlit-plotly-events dependency)
+    event = st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config=config,
+        on_select="rerun",
+        selection_mode=["points"],
+        key=PLOT_KEY,
+    )
 
+    try:
+        pts = event.selection.points  # Streamlit selection object
+        if pts and isinstance(pts, list):
+            p0 = pts[0]
+            curve = p0.get("curve_number")
+            pidx = p0.get("point_index")
+            if curve is not None and pidx is not None:
+                clicked_genre = clicked_genre_from_selection(fig, label_indices, int(curve), int(pidx))
+    except Exception:
+        clicked_genre = None
+
+    # IMPORTANT: avoid infinite reruns (selection persists across reruns)
     if clicked_genre:
-        st.session_state.selected_genre = clicked_genre
-        st.session_state.active_path = []
-        push_history(clicked_genre)
-        st.rerun()
+        needs_update = (st.session_state.selected_genre != clicked_genre) or bool(st.session_state.active_path)
+        if needs_update:
+            st.session_state.selected_genre = clicked_genre
+            st.session_state.active_path = []
+            push_history(clicked_genre)
+            st.rerun()
 
     st.caption("Tip: drag to pan; mouse wheel zooms.")
 
@@ -836,9 +823,7 @@ with col_right:
         if not wiki_title:
             st.warning("No mapped Wikipedia page for this genre yet. (It may be listed in wiki_needs_review.csv.)")
         else:
-            # Always define info so later code can't crash if Wikipedia call fails
             info = {"title": wiki_title, "paragraph": "", "url": f"https://en.wikipedia.org/wiki/{wiki_title.replace(' ', '_')}"}
-
             try:
                 info = wiki_intro_by_title(wiki_title)
             except Exception as e:
