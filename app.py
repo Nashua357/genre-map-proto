@@ -655,6 +655,7 @@ def build_map_figure(active: str) -> Tuple[go.Figure, np.ndarray]:
 
     label_indices = label_idxs_default
     label_trace   = None
+    active_label_trace = None
     if show_labels:
         label_indices = pick_label_points(df, max_labels=default_label_count)
         label_trace   = go.Scatter(
@@ -667,12 +668,26 @@ def build_map_figure(active: str) -> Tuple[go.Figure, np.ndarray]:
             hoverinfo="skip", name="labels", showlegend=False,
         )
 
+    if active and active in genre_to_idx:
+        ai = genre_to_idx[active]
+        active_label_trace = go.Scatter(
+            x=[df.at[ai, "x"]],
+            y=[df.at[ai, "y"]],
+            mode="text",
+            text=[active],
+            textposition="top center",
+            textfont=dict(size=label_size + 1, color="rgba(255,255,255,1.0)"),
+            hoverinfo="skip", name="active_label", showlegend=False,
+        )
+
     fig = go.Figure()
     for tr in line_traces:
         fig.add_trace(tr)
     fig.add_trace(marker_trace)
     if label_trace is not None:
         fig.add_trace(label_trace)
+    if active_label_trace is not None:
+        fig.add_trace(active_label_trace)
 
     rev = f"map-v7-{map_fit}-{st.session_state.reset_view_tick}"
 
@@ -714,6 +729,8 @@ def clicked_genre_from_selection(
             gi = int(label_indices[pidx])
             if 0 <= gi < len(genres):
                 return genres[gi]
+    if name == "active_label":
+        return st.session_state._active_genre or None
     return None
 
 
@@ -746,13 +763,15 @@ def map_and_details():
             "modeBarButtonsToRemove": ["select2d", "lasso2d"],
         }
 
+        plot_key = f"{PLOT_KEY}-{map_fit}-{st.session_state.reset_view_tick}"
+
         event = st.plotly_chart(
             fig,
             use_container_width=True,
             config=config,
             on_select="rerun",          # only reruns THIS fragment
             selection_mode=["points"],
-            key=PLOT_KEY,
+            key=plot_key,
         )
 
         # Detect click from on_select event
