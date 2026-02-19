@@ -46,6 +46,11 @@ st.markdown(
     .stSelectbox label { cursor: pointer; }
     .stSelectbox div[data-baseweb="select"] { cursor: pointer; }
     .stTextInput label { cursor: text; }
+    /* Remove scrollbars from Spotify embed iframe container */
+    iframe[src*="spotify"] { border: none; }
+    .stHtml { overflow: hidden !important; }
+    div[data-testid="stHtml"] { overflow: hidden !important; }
+    div[data-testid="stHtml"] > div { overflow: hidden !important; }
     </style>
     """,
     unsafe_allow_html=True,
@@ -58,6 +63,31 @@ WIKI_API          = "https://en.wikipedia.org/w/api.php"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 SPOTIFY_API_BASE  = "https://api.spotify.com/v1"
 PLOT_KEY          = "genre_map_plot"
+
+# ---------------------------------------------------------------------------
+# Session state initialisation  (MUST be before any widgets)
+# ---------------------------------------------------------------------------
+_DEFAULTS = {
+    "selected_genre":     "(none)",
+    "destination_genre":  "(none)",
+    "selection_history":  [],
+    "active_path":        [],
+    "market":             "AU",
+    "reset_view_tick":    0,
+    "applied_reset_tick": -1,
+    "_pending_click":     None,       # bridge for click → selectbox
+}
+for _k, _v in _DEFAULTS.items():
+    if _k not in st.session_state:
+        st.session_state[_k] = _v
+
+# ---- Process any pending click BEFORE widgets render --------------------
+# This is the fix for the StreamlitAPIException: we set the widget-bound
+# key *before* the selectbox renders, which Streamlit allows.
+if st.session_state._pending_click is not None:
+    st.session_state.selected_genre  = st.session_state._pending_click
+    st.session_state.active_path     = []
+    st.session_state._pending_click  = None
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -95,6 +125,7 @@ def http_get(url: str, params: dict, timeout: int = 30) -> dict:
 # ---------------------------------------------------------------------------
 # Spotify helpers
 # ---------------------------------------------------------------------------
+@st.cache_data(show_spinner=False, ttl=3300)   # cache ~55 min (token lasts 60)
 def spotify_get_token() -> Optional[str]:
     client_id     = st.secrets.get("SPOTIFY_CLIENT_ID", None)
     client_secret = st.secrets.get("SPOTIFY_CLIENT_SECRET", None)
@@ -127,13 +158,13 @@ def spotify_search_track(token: str, query: str, market: str) -> Optional[dict]:
 
 
 def spotify_embed_html(track_id: str) -> str:
-    return f"""
-<iframe style="border-radius:12px"
-  src="https://open.spotify.com/embed/track/{track_id}?utm_source=generator"
-  width="100%" height="152" frameborder="0"
-  allow="autoplay; clipboard-write; encrypted-media; fullscreen; picture-in-picture"
-  loading="lazy"></iframe>
-"""
+    return (
+        f'<iframe style="border-radius:12px; border:none;" '
+        f'src="https://open.spotify.com/embed/track/{track_id}?utm_source=generator" '
+        f'width="100%" height="152" frameborder="0" scrolling="no" '
+        f'allow="autoplay; clipboard-write; encrypted-media; fullscreen; '
+        f'picture-in-picture" loading="lazy"></iframe>'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +252,7 @@ def load_wiki_title_maps() -> Tuple[dict, dict]:
             for _, row in mdf.iterrows():
                 g = norm_title(str(row.get("genre", "")))
                 t = str(row.get("wiki_title", "")).strip()
-                if g and t:
+                if g and t and str(t).lower() != "nan":
                     generated[g] = t
 
     return overrides, generated
@@ -393,21 +424,8 @@ def pick_label_points(df: pd.DataFrame, max_labels: int = 120) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Session state initialisation
+# History helper
 # ---------------------------------------------------------------------------
-for _k, _v in {
-    "selected_genre":    "(none)",
-    "destination_genre": "(none)",
-    "selection_history": [],
-    "active_path":       [],
-    "market":            "AU",
-    "reset_view_tick":   0,
-    "applied_reset_tick": -1,
-}.items():
-    if _k not in st.session_state:
-        st.session_state[_k] = _v
-
-
 def push_history(genre: str, max_items: int = 12) -> None:
     g = (genre or "").strip()
     if not g or g == "(none)":
@@ -427,10 +445,8 @@ with st.sidebar:
     st.caption("Click dots or pick genres to build history.")
     if st.session_state.selection_history:
         for g in st.session_state.selection_history:
-            if st.button(g, use_container_width=True):
-                st.session_state.selected_genre = g
-                st.session_state.active_path    = []
-                push_history(g)
+            if st.button(g, use_container_width=True, key=f"hist_{g}"):
+                st.session_state._pending_click = g
                 st.rerun()
         cols = st.columns([1, 1])
         if cols[0].button("Clear", use_container_width=True):
@@ -671,11 +687,15 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
         template="plotly_dark",
         height=650,
         margin=dict(l=0, r=0, t=0, b=0),
-        dragmode="pan",
+        # Use "zoom" as default drag so single-clicks register as point
+        # selections.  "pan" mode intercepts clicks as drag starts, which
+        # prevents on_select from firing.  Users can still pan via the
+        # toolbar pan button or shift-drag.
+        dragmode="zoom",
         hovermode="closest",
-        clickmode="event+select",
-        # uirevision keeps your zoom/pan state across reruns
-        uirevision=f"map-v4-{map_fit}-{st.session_state.reset_view_tick}",
+        # STABLE uirevision: only changes on explicit reset or shape toggle.
+        # Genre selection does NOT change it → map keeps zoom/pan position.
+        uirevision=f"map-v5-{map_fit}-{st.session_state.reset_view_tick}",
     )
 
     if st.session_state.applied_reset_tick != st.session_state.reset_view_tick:
@@ -734,6 +754,7 @@ with col_mid:
         key=PLOT_KEY,
     )
 
+    # --- Read clicked genre from the Plotly selection event ----------------
     clicked_genre: Optional[str] = None
     try:
         pts = event.selection.points
@@ -742,20 +763,25 @@ with col_mid:
             curve = p0.get("curve_number")
             pidx  = p0.get("point_index")
             if curve is not None and pidx is not None:
-                clicked_genre = clicked_genre_from_selection(fig, label_indices, int(curve), int(pidx))
+                clicked_genre = clicked_genre_from_selection(
+                    fig, label_indices, int(curve), int(pidx)
+                )
     except Exception:
         clicked_genre = None
 
-    # Avoid infinite reruns: only rerun when something actually changed
+    # --- Apply the click via _pending_click → rerun -----------------------
+    # We do NOT write to st.session_state.selected_genre here (it's widget-
+    # bound to the selectbox). Instead we set _pending_click and rerun; at
+    # the top of the next run it is applied BEFORE the selectbox renders.
     if clicked_genre:
-        needs_update = (st.session_state.selected_genre != clicked_genre) or bool(st.session_state.active_path)
-        if needs_update:
-            st.session_state.selected_genre = clicked_genre
-            st.session_state.active_path    = []
+        current  = st.session_state.selected_genre
+        has_path = bool(st.session_state.active_path)
+        if current != clicked_genre or has_path:
             push_history(clicked_genre)
+            st.session_state._pending_click = clicked_genre
             st.rerun()
 
-    st.caption("Tip: drag to pan; mouse wheel zooms.")
+    st.caption("Tip: scroll to zoom · click a dot to select · shift-drag to pan")
 
 
 # ---------------------------------------------------------------------------
@@ -814,8 +840,12 @@ with col_right:
                 else:
                     st.markdown("**Example:**")
                 st.write(f"{track_name} — {artist_names}")
-                # Note: no key= argument here — it's not supported in all Streamlit versions
-                st.components.v1.html(spotify_embed_html(track_id), height=170, scrolling=False)
+                # Embed with no scrollbars — height includes padding
+                st.components.v1.html(
+                    spotify_embed_html(track_id),
+                    height=160,
+                    scrolling=False,
+                )
                 open_url = example_track.get("external_urls", {}).get("spotify")
                 if open_url:
                     st.link_button("Open in Spotify", open_url)
