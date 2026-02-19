@@ -46,7 +46,6 @@ st.markdown(
     .stSelectbox label { cursor: pointer; }
     .stSelectbox div[data-baseweb="select"] { cursor: pointer; }
     .stTextInput label { cursor: text; }
-    /* Remove scrollbars from Spotify embed iframe container */
     iframe[src*="spotify"] { border: none; }
     .stHtml { overflow: hidden !important; }
     div[data-testid="stHtml"] { overflow: hidden !important; }
@@ -68,23 +67,26 @@ PLOT_KEY          = "genre_map_plot"
 # Session state initialisation  (MUST be before any widgets)
 # ---------------------------------------------------------------------------
 _DEFAULTS = {
-    "selected_genre":     "(none)",
-    "destination_genre":  "(none)",
+    "selected_genre":     "(none)",   # widget-bound (selectbox)
+    "destination_genre":  "(none)",   # widget-bound (selectbox)
+    "_active_genre":      "",         # NOT widget-bound — true current genre
     "selection_history":  [],
     "active_path":        [],
     "market":             "AU",
     "reset_view_tick":    0,
-    "_pending_click":     None,       # bridge for click → selectbox
+    "_pending_click":     None,       # bridge: fragment click → selectbox
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
 
-# ---- Process any pending click BEFORE widgets render --------------------
-# This is the fix for the StreamlitAPIException: we set the widget-bound
-# key *before* the selectbox renders, which Streamlit allows.
+# Process any pending click BEFORE selectbox renders so the dropdown shows
+# the clicked genre.  _pending_click is set by the fragment on dot-click
+# and consumed here on the next FULL rerun (triggered by any non-fragment
+# widget interaction).
 if st.session_state._pending_click is not None:
     st.session_state.selected_genre  = st.session_state._pending_click
+    st.session_state._active_genre   = st.session_state._pending_click
     st.session_state.active_path     = []
     st.session_state._pending_click  = None
 
@@ -124,7 +126,7 @@ def http_get(url: str, params: dict, timeout: int = 30) -> dict:
 # ---------------------------------------------------------------------------
 # Spotify helpers
 # ---------------------------------------------------------------------------
-@st.cache_data(show_spinner=False, ttl=3300)   # cache ~55 min (token lasts 60)
+@st.cache_data(show_spinner=False, ttl=3300)
 def spotify_get_token() -> Optional[str]:
     client_id     = st.secrets.get("SPOTIFY_CLIENT_ID", None)
     client_secret = st.secrets.get("SPOTIFY_CLIENT_SECRET", None)
@@ -170,7 +172,6 @@ def spotify_embed_html(track_id: str) -> str:
 # Data loading
 # ---------------------------------------------------------------------------
 def _parse_df(df: pd.DataFrame) -> pd.DataFrame:
-    """Normalize genre/x/y/r/g/b columns from a raw CSV dataframe."""
     colmap     = {c.lower(): c for c in df.columns}
     genre_col  = colmap.get("genre") or colmap.get("name")
     x_col      = colmap.get("x")
@@ -179,7 +180,6 @@ def _parse_df(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("CSV must contain columns: genre (or name), x, y")
     df = df.rename(columns={genre_col: "genre", x_col: "x", y_col: "y"})
 
-    # Colour: prefer r/g/b; fall back to hex_colour / hex / color; else grey
     r_col, g_col, b_col = colmap.get("r"), colmap.get("g"), colmap.get("b")
     if r_col and g_col and b_col:
         df = df.rename(columns={r_col: "r", g_col: "g", b_col: "b"})
@@ -213,10 +213,7 @@ def load_genre_data_from_repo() -> pd.DataFrame:
     base = Path(__file__).resolve().parent
     path = base / "data" / "genre_attrs.csv"
     if not path.exists():
-        raise FileNotFoundError(
-            "Missing data/genre_attrs.csv in the repo. "
-            "Add the EveryNoise-derived CSV to your repository."
-        )
+        raise FileNotFoundError("Missing data/genre_attrs.csv in the repo.")
     return _parse_df(pd.read_csv(path))
 
 
@@ -229,7 +226,6 @@ def load_genre_data_from_upload(uploaded_file) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def load_wiki_title_maps() -> Tuple[dict, dict]:
-    """Returns (overrides_map, generated_map) keyed by norm_title(genre)."""
     base           = Path(__file__).resolve().parent
     overrides_path = base / "data" / "wiki_overrides.csv"
     map_path       = base / "data" / "wiki_map.csv"
@@ -268,13 +264,8 @@ def wiki_intro_by_title(title: str) -> dict:
     js = http_get(
         WIKI_API,
         params={
-            "action":      "query",
-            "prop":        "extracts",
-            "exintro":     1,
-            "explaintext": 1,
-            "redirects":   1,
-            "titles":      title,
-            "format":      "json",
+            "action": "query", "prop": "extracts", "exintro": 1,
+            "explaintext": 1, "redirects": 1, "titles": title, "format": "json",
         },
     )
     pages     = js.get("query", {}).get("pages", {})
@@ -366,7 +357,7 @@ def compute_neighbors(xy: np.ndarray, k: int = 8) -> np.ndarray:
     nn = NearestNeighbors(n_neighbors=min(k + 1, len(xy)), algorithm="auto")
     nn.fit(xy)
     _dists, idxs = nn.kneighbors(xy)
-    return idxs[:, 1:]   # drop self
+    return idxs[:, 1:]
 
 
 def build_adjacency(neighbors: np.ndarray) -> List[List[int]]:
@@ -404,12 +395,12 @@ def shortest_path(adj: List[List[int]], start: int, goal: int) -> List[int]:
 
 
 def pick_label_points(df: pd.DataFrame, max_labels: int = 120) -> np.ndarray:
-    max_labels        = int(clamp(max_labels, 10, 500))
-    x                 = df["x"].to_numpy()
-    y                 = df["y"].to_numpy()
-    bins              = int(clamp(int(np.sqrt(max_labels) * 1.5), 8, 45))
-    x_min, x_max      = float(x.min()), float(x.max())
-    y_min, y_max      = float(y.min()), float(y.max())
+    max_labels   = int(clamp(max_labels, 10, 500))
+    x            = df["x"].to_numpy()
+    y            = df["y"].to_numpy()
+    bins         = int(clamp(int(np.sqrt(max_labels) * 1.5), 8, 45))
+    x_min, x_max = float(x.min()), float(x.max())
+    y_min, y_max = float(y.min()), float(y.max())
     gx = np.floor((x - x_min) / (x_max - x_min + 1e-9) * bins).astype(int)
     gy = np.floor((y - y_min) / (y_max - y_min + 1e-9) * bins).astype(int)
     chosen: dict = {}
@@ -528,18 +519,14 @@ default_yrange = [y_min - pad_y, y_max + pad_y]
 
 
 # ---------------------------------------------------------------------------
-# Main layout
+# Title + Controls (left column)
 # ---------------------------------------------------------------------------
 st.title("Phase 1 Prototype — Genre Map")
-col_left, col_mid, col_right = st.columns([0.33, 0.44, 0.23], gap="large")
+col_left, col_main = st.columns([0.33, 0.67], gap="large")
 
-
-# ---------------------------------------------------------------------------
-# Controls panel (left)
-# ---------------------------------------------------------------------------
 with col_left:
     st.subheader("Controls")
-    search   = st.text_input("Search genre", value="")
+    search = st.text_input("Search genre", value="")
     if search.strip():
         filtered = [g for g in genres if search.lower() in g.lower()] or genres
     else:
@@ -551,9 +538,14 @@ with col_left:
         options = ["(none)", cur] + filtered
 
     st.selectbox("Selected genre", options, key="selected_genre")
-    selected_genre = "" if st.session_state.selected_genre == "(none)" else st.session_state.selected_genre
-    if selected_genre:
-        push_history(selected_genre)
+    # Sync _active_genre from the dropdown (runs on every full rerun)
+    sel_from_dropdown = st.session_state.selected_genre
+    if sel_from_dropdown != "(none)":
+        st.session_state._active_genre = sel_from_dropdown
+        push_history(sel_from_dropdown)
+    elif st.session_state._pending_click is None:
+        # Only clear _active_genre if no pending click
+        st.session_state._active_genre = ""
 
     st.markdown("---")
 
@@ -565,12 +557,13 @@ with col_left:
 
         cols = st.columns([1, 1])
         if cols[0].button("Find shortest path", use_container_width=True):
-            if not selected_genre or not dest:
+            sel_g = st.session_state._active_genre
+            if not sel_g or not dest:
                 st.warning("Pick both a start genre and a destination genre.")
-            elif selected_genre not in genre_to_idx or dest not in genre_to_idx:
+            elif sel_g not in genre_to_idx or dest not in genre_to_idx:
                 st.warning("One of the chosen genres isn't in the dataset.")
             else:
-                p = shortest_path(adj, genre_to_idx[selected_genre], genre_to_idx[dest])
+                p = shortest_path(adj, genre_to_idx[sel_g], genre_to_idx[dest])
                 if not p:
                     st.warning("No path found (graph disconnected for these two).")
                     st.session_state.active_path = []
@@ -584,16 +577,15 @@ with col_left:
 
 
 # ---------------------------------------------------------------------------
-# Map figure builder
+# Map figure builder (called from within the fragment)
 # ---------------------------------------------------------------------------
-def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
-    sel        = "" if st.session_state.selected_genre == "(none)" else st.session_state.selected_genre
+def build_map_figure(active: str) -> Tuple[go.Figure, np.ndarray]:
     fade       = clamp(fade_others / 100.0, 0.0, 0.95)
     ls         = clamp(line_strength / 100.0, 0.0, 1.0)
     active_idxs = None
 
-    if sel and sel in genre_to_idx:
-        si          = genre_to_idx[sel]
+    if active and active in genre_to_idx:
+        si          = genre_to_idx[active]
         active_idxs = set(adj[si]) | {si}
 
     if st.session_state.active_path:
@@ -607,8 +599,8 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
         rgba.append(f"rgba({r},{g},{b},{a})")
 
     sizes = np.full(len(df), dot_size, dtype=float)
-    if sel and sel in genre_to_idx:
-        sizes[genre_to_idx[sel]] = dot_size + 4
+    if active and active in genre_to_idx:
+        sizes[genre_to_idx[active]] = dot_size + 4
     for i in (st.session_state.active_path or []):
         if 0 <= i < len(sizes):
             sizes[i] = max(sizes[i], dot_size + 3)
@@ -627,8 +619,8 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
                 hoverinfo="skip", name="edges", showlegend=False,
             ))
         else:
-            xs, ys      = [], []
-            active_set  = set(active_idxs)
+            xs, ys     = [], []
+            active_set = set(active_idxs)
             for i in active_set:
                 for j in adj[i]:
                     if j in active_set and j >= i:
@@ -682,40 +674,24 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
     if label_trace is not None:
         fig.add_trace(label_trace)
 
-    # Stable revision string — only changes on explicit reset or shape toggle.
-    # Genre selection does NOT change it, so the map keeps its zoom/pan.
-    rev = f"map-v6-{map_fit}-{st.session_state.reset_view_tick}"
+    rev = f"map-v7-{map_fit}-{st.session_state.reset_view_tick}"
 
     fig.update_layout(
         template="plotly_dark",
         height=650,
         margin=dict(l=0, r=0, t=0, b=0),
-        # dragmode=False prevents clicks from being intercepted as
-        # zoom-box or pan gestures.  Scroll-zoom still works (via config).
-        # Users can switch to pan/zoom via the Plotly toolbar if needed.
         dragmode=False,
         hovermode="closest",
         uirevision=rev,
     )
-
-    # Always set explicit ranges + autorange=False.  The axis-level
-    # uirevision ensures that user zoom/pan is preserved across reruns:
-    # Plotly's UI state overrides the "range" we specify here as long as
-    # the uirevision string hasn't changed.
     fig.update_xaxes(
-        visible=False,
-        range=default_xrange,
-        autorange=False,
-        uirevision=rev,
+        visible=False, range=default_xrange,
+        autorange=False, uirevision=rev,
     )
     fig.update_yaxes(
-        visible=False,
-        range=default_yrange,
-        autorange=False,
-        uirevision=rev,
+        visible=False, range=default_yrange,
+        autorange=False, uirevision=rev,
     )
-    # When user clicks "Reset map view", reset_view_tick changes → rev
-    # changes → Plotly drops its UI state and applies our default ranges.
 
     if map_fit == "Original":
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
@@ -742,128 +718,153 @@ def clicked_genre_from_selection(
 
 
 # ---------------------------------------------------------------------------
-# Map (middle column)
+# FRAGMENT: Map + Genre details
+#
+# @st.fragment isolates this section from the rest of the page.  When
+# on_select fires (dot click), ONLY this fragment re-executes — the page
+# around it (sidebar, controls) stays put.  Crucially, the Plotly component
+# is *updated* (new props) rather than *recreated* (unmount/mount), which
+# lets uirevision preserve the user's zoom and pan state.
 # ---------------------------------------------------------------------------
-with col_mid:
-    st.subheader("Map (click a dot)")
-    fig, label_indices = build_map_figure()
+@st.fragment
+def map_and_details():
+    col_map, col_details = st.columns([0.65, 0.35], gap="large")
 
-    config = {
-        "scrollZoom": True,
-        "displaylogo": False,
-        "responsive": True,
-        "modeBarButtonsToRemove": ["select2d", "lasso2d"],
-    }
+    # Read the current active genre (may have been set by dropdown or
+    # previous fragment click)
+    active = st.session_state._active_genre
 
-    # Native Streamlit Plotly selection — no external library needed
-    event = st.plotly_chart(
-        fig,
-        use_container_width=True,
-        config=config,
-        on_select="rerun",
-        selection_mode=["points"],
-        key=PLOT_KEY,
-    )
+    # ---- Map column -------------------------------------------------------
+    with col_map:
+        st.subheader("Map (click a dot)")
+        fig, label_indices = build_map_figure(active)
 
-    # --- Read clicked genre from the Plotly selection event ----------------
-    clicked_genre: Optional[str] = None
-    try:
-        pts = event.selection.points
-        if pts and isinstance(pts, list):
-            p0    = pts[0]
-            curve = p0.get("curve_number")
-            pidx  = p0.get("point_index")
-            if curve is not None and pidx is not None:
-                clicked_genre = clicked_genre_from_selection(
-                    fig, label_indices, int(curve), int(pidx)
-                )
-    except Exception:
-        clicked_genre = None
+        config = {
+            "scrollZoom": True,
+            "displaylogo": False,
+            "responsive": True,
+            "modeBarButtonsToRemove": ["select2d", "lasso2d"],
+        }
 
-    # --- Apply the click via _pending_click → rerun -----------------------
-    # We do NOT write to st.session_state.selected_genre here (it's widget-
-    # bound to the selectbox). Instead we set _pending_click and rerun; at
-    # the top of the next run it is applied BEFORE the selectbox renders.
-    if clicked_genre:
-        current  = st.session_state.selected_genre
-        has_path = bool(st.session_state.active_path)
-        if current != clicked_genre or has_path:
-            push_history(clicked_genre)
+        event = st.plotly_chart(
+            fig,
+            use_container_width=True,
+            config=config,
+            on_select="rerun",          # only reruns THIS fragment
+            selection_mode=["points"],
+            key=PLOT_KEY,
+        )
+
+        # Detect click from on_select event
+        clicked_genre: Optional[str] = None
+        try:
+            pts = event.selection.points
+            if pts and isinstance(pts, list):
+                p0    = pts[0]
+                curve = p0.get("curve_number")
+                pidx  = p0.get("point_index")
+                if curve is not None and pidx is not None:
+                    clicked_genre = clicked_genre_from_selection(
+                        fig, label_indices, int(curve), int(pidx)
+                    )
+        except Exception:
+            clicked_genre = None
+
+        # Apply click — update _active_genre immediately (no st.rerun!)
+        if clicked_genre and clicked_genre != active:
+            st.session_state._active_genre = clicked_genre
             st.session_state._pending_click = clicked_genre
-            st.rerun()
+            st.session_state.active_path = []
+            push_history(clicked_genre)
+            active = clicked_genre      # use for details panel below
 
-    st.caption("Tip: scroll to zoom · click a dot to select · use toolbar to pan")
+        st.caption("Tip: scroll to zoom · click a dot to select · use toolbar to pan")
 
+    # ---- Genre details column ---------------------------------------------
+    with col_details:
+        st.subheader("Genre details")
 
-# ---------------------------------------------------------------------------
-# Genre details (right column)
-# ---------------------------------------------------------------------------
-with col_right:
-    st.subheader("Genre details")
-    sel = "" if st.session_state.selected_genre == "(none)" else st.session_state.selected_genre
-
-    if not sel:
-        st.write("Pick a genre from the dropdown or click a dot on the map.")
-    else:
-        st.markdown(f"### {sel}")
-        wiki_title = resolve_wiki_title_for_genre(sel)
-
-        if not wiki_title:
-            st.warning("No mapped Wikipedia page for this genre yet.")
+        if not active:
+            st.write("Pick a genre from the dropdown or click a dot on the map.")
         else:
-            info = {"title": wiki_title, "paragraph": "", "url": f"https://en.wikipedia.org/wiki/{wiki_title.replace(' ','_')}"}
-            try:
-                info = wiki_intro_by_title(wiki_title)
-            except Exception as e:
-                st.warning(f"Could not load Wikipedia intro: {e}")
+            st.markdown(f"### {active}")
+            wiki_title = resolve_wiki_title_for_genre(active)
 
-            para = (info.get("paragraph") or "").strip()
-            url  = (info.get("url") or "").strip()
-            if para:
-                st.write(para)
+            if not wiki_title:
+                st.warning("No mapped Wikipedia page for this genre yet.")
             else:
-                st.caption("No summary available for this page.")
-            if url:
-                st.link_button("Open Wikipedia article", url)
+                info = {
+                    "title": wiki_title, "paragraph": "",
+                    "url": f"https://en.wikipedia.org/wiki/{wiki_title.replace(' ','_')}",
+                }
+                try:
+                    info = wiki_intro_by_title(wiki_title)
+                except Exception as e:
+                    st.warning(f"Could not load Wikipedia intro: {e}")
 
-        st.markdown("---")
-        token  = spotify_get_token()
-        market = st.session_state.market
-
-        if not token:
-            st.info("Spotify credentials not found. Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to Streamlit Secrets.")
-        else:
-            example_track = None
-            try:
-                if wiki_title:
-                    example_track = pick_spotify_example_from_wikipedia(token, wiki_title, market)
-            except Exception:
-                example_track = None
-
-            if example_track and example_track.get("id"):
-                track_id     = example_track["id"]
-                track_name   = example_track.get("name", "Example track")
-                artist_names = ", ".join([a.get("name", "") for a in example_track.get("artists", [])])
-                picked_from  = example_track.get("_picked_from_artist")
-
-                if picked_from:
-                    st.markdown(f"**Example (artist mentioned in intro):** {picked_from}")
+                para = (info.get("paragraph") or "").strip()
+                url  = (info.get("url") or "").strip()
+                if para:
+                    st.write(para)
                 else:
-                    st.markdown("**Example:**")
-                st.write(f"{track_name} — {artist_names}")
-                # Embed with no scrollbars — height includes padding
-                st.components.v1.html(
-                    spotify_embed_html(track_id),
-                    height=160,
-                    scrolling=False,
-                )
-                open_url = example_track.get("external_urls", {}).get("spotify")
-                if open_url:
-                    st.link_button("Open in Spotify", open_url)
-            else:
-                st.caption("No Spotify example found for this genre right now.")
+                    st.caption("No summary available for this page.")
+                if url:
+                    st.link_button("Open Wikipedia article", url)
 
-    st.markdown(
-        "<div class='small-muted'>Data: EveryNoise-derived genre attributes (genre, x, y, colour)</div>",
-        unsafe_allow_html=True,
-    )
+            st.markdown("---")
+            token  = spotify_get_token()
+            market = st.session_state.market
+
+            if not token:
+                st.info(
+                    "Spotify credentials not found. "
+                    "Add SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET to Streamlit Secrets."
+                )
+            else:
+                example_track = None
+                try:
+                    if wiki_title:
+                        example_track = pick_spotify_example_from_wikipedia(
+                            token, wiki_title, market
+                        )
+                except Exception:
+                    example_track = None
+
+                if example_track and example_track.get("id"):
+                    track_id     = example_track["id"]
+                    track_name   = example_track.get("name", "Example track")
+                    artist_names = ", ".join(
+                        [a.get("name", "") for a in example_track.get("artists", [])]
+                    )
+                    picked_from = example_track.get("_picked_from_artist")
+
+                    if picked_from:
+                        st.markdown(
+                            f"**Example (artist mentioned in intro):** {picked_from}"
+                        )
+                    else:
+                        st.markdown("**Example:**")
+                    st.write(f"{track_name} — {artist_names}")
+                    st.components.v1.html(
+                        spotify_embed_html(track_id),
+                        height=160,
+                        scrolling=False,
+                    )
+                    open_url = example_track.get("external_urls", {}).get("spotify")
+                    if open_url:
+                        st.link_button("Open in Spotify", open_url)
+                else:
+                    st.caption("No Spotify example found for this genre right now.")
+
+        st.markdown(
+            "<div class='small-muted'>Data: EveryNoise-derived genre attributes "
+            "(genre, x, y, colour)</div>",
+            unsafe_allow_html=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Render the fragment inside col_main
+# ---------------------------------------------------------------------------
+with col_main:
+    map_and_details()
