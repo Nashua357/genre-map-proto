@@ -74,7 +74,6 @@ _DEFAULTS = {
     "active_path":        [],
     "market":             "AU",
     "reset_view_tick":    0,
-    "applied_reset_tick": -1,
     "_pending_click":     None,       # bridge for click → selectbox
 }
 for _k, _v in _DEFAULTS.items():
@@ -683,28 +682,40 @@ def build_map_figure() -> Tuple[go.Figure, np.ndarray]:
     if label_trace is not None:
         fig.add_trace(label_trace)
 
+    # Stable revision string — only changes on explicit reset or shape toggle.
+    # Genre selection does NOT change it, so the map keeps its zoom/pan.
+    rev = f"map-v6-{map_fit}-{st.session_state.reset_view_tick}"
+
     fig.update_layout(
         template="plotly_dark",
         height=650,
         margin=dict(l=0, r=0, t=0, b=0),
-        # Use "zoom" as default drag so single-clicks register as point
-        # selections.  "pan" mode intercepts clicks as drag starts, which
-        # prevents on_select from firing.  Users can still pan via the
-        # toolbar pan button or shift-drag.
-        dragmode="zoom",
+        # dragmode=False prevents clicks from being intercepted as
+        # zoom-box or pan gestures.  Scroll-zoom still works (via config).
+        # Users can switch to pan/zoom via the Plotly toolbar if needed.
+        dragmode=False,
         hovermode="closest",
-        # STABLE uirevision: only changes on explicit reset or shape toggle.
-        # Genre selection does NOT change it → map keeps zoom/pan position.
-        uirevision=f"map-v5-{map_fit}-{st.session_state.reset_view_tick}",
+        uirevision=rev,
     )
 
-    if st.session_state.applied_reset_tick != st.session_state.reset_view_tick:
-        fig.update_xaxes(visible=False, range=default_xrange)
-        fig.update_yaxes(visible=False, range=default_yrange)
-        st.session_state.applied_reset_tick = st.session_state.reset_view_tick
-    else:
-        fig.update_xaxes(visible=False)
-        fig.update_yaxes(visible=False)
+    # Always set explicit ranges + autorange=False.  The axis-level
+    # uirevision ensures that user zoom/pan is preserved across reruns:
+    # Plotly's UI state overrides the "range" we specify here as long as
+    # the uirevision string hasn't changed.
+    fig.update_xaxes(
+        visible=False,
+        range=default_xrange,
+        autorange=False,
+        uirevision=rev,
+    )
+    fig.update_yaxes(
+        visible=False,
+        range=default_yrange,
+        autorange=False,
+        uirevision=rev,
+    )
+    # When user clicks "Reset map view", reset_view_tick changes → rev
+    # changes → Plotly drops its UI state and applies our default ranges.
 
     if map_fit == "Original":
         fig.update_yaxes(scaleanchor="x", scaleratio=1)
@@ -741,7 +752,7 @@ with col_mid:
         "scrollZoom": True,
         "displaylogo": False,
         "responsive": True,
-        "modeBarButtonsToRemove": ["select2d", "lasso2d", "autoScale2d", "resetScale2d"],
+        "modeBarButtonsToRemove": ["select2d", "lasso2d"],
     }
 
     # Native Streamlit Plotly selection — no external library needed
@@ -781,7 +792,7 @@ with col_mid:
             st.session_state._pending_click = clicked_genre
             st.rerun()
 
-    st.caption("Tip: scroll to zoom · click a dot to select · shift-drag to pan")
+    st.caption("Tip: scroll to zoom · click a dot to select · use toolbar to pan")
 
 
 # ---------------------------------------------------------------------------
